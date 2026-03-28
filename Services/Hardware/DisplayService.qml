@@ -5,6 +5,7 @@ import Quickshell.Io
 import qs.Commons
 import qs.Services.Hardware
 import qs.Services.Compositor
+import qs.Services.UI
 
 Singleton
 {
@@ -31,6 +32,9 @@ Singleton
   property string edidHex: ""
   property string edidDecoded: ""
   property string edidError: ""
+  property bool persistRunning: false
+  property string persistError: ""
+  property bool persistDidWrite: false
 
   function _getDisplayBackendHint() {
     if (typeof CompositorService === "undefined") return "fallback";
@@ -38,6 +42,161 @@ Singleton
     if (CompositorService.isNiri) return "niri";
     if (CompositorService.isSway) return "sway";
     return "fallback";
+  }
+
+  function isPersistenceSupported() {
+    const backend = getBackend();
+    if (!backend
+        || !backend.buildPersistencePayload
+        || !backend.getPersistenceConfigPath
+        || !backend.getPersistenceMarkers
+        || !backend.getPersistenceLegacyMode
+        || !backend.getPersistenceLegacyCommentStyle)
+      return false;
+
+    const style = backend.getPersistenceLegacyCommentStyle();
+    if (style === "block") {
+      return !!(backend.getPersistenceBlockCommentStart && backend.getPersistenceBlockCommentEnd);
+    }
+    return !!(backend
+              && backend.getPersistenceCommentPrefix);
+  }
+
+  function _shellSingleQuote(text) {
+    return "'" + String(text || "").replace(/'/g, "'\\''") + "'";
+  }
+
+  function _buildPersistenceScript(path, beginMarker, endMarker, payload, legacyMode, commentStyle, commentPrefix, blockCommentStart, blockCommentEnd) {
+    const tag = "NOCTALIA_DISPLAY_PAYLOAD";
+    const savedToken = "__NOCTALIA_PERSIST_SAVED__";
+    const unchangedToken = "__NOCTALIA_PERSIST_UNCHANGED__";
+    let script = "set -eu\n";
+    script += "cfg=" + _shellSingleQuote(path) + "\n";
+    script += "begin=" + _shellSingleQuote(beginMarker) + "\n";
+    script += "end=" + _shellSingleQuote(endMarker) + "\n";
+    script += "mode=" + _shellSingleQuote(legacyMode) + "\n";
+    script += "comment_style=" + _shellSingleQuote(commentStyle || "line") + "\n";
+    script += "comment_prefix=" + _shellSingleQuote(commentPrefix) + "\n";
+    script += "block_start=" + _shellSingleQuote(blockCommentStart || "") + "\n";
+    script += "block_end=" + _shellSingleQuote(blockCommentEnd || "") + "\n";
+    script += "mkdir -p \"$(dirname \"$cfg\")\"\n";
+    script += "touch \"$cfg\"\n";
+    script += "tmp_payload=\"$(mktemp)\"\n";
+    script += "tmp_clean=\"$(mktemp)\"\n";
+    script += "tmp_legacy=\"$(mktemp)\"\n";
+    script += "tmp_new=\"$(mktemp)\"\n";
+    script += "trap 'rm -f \"$tmp_payload\" \"$tmp_clean\" \"$tmp_legacy\" \"$tmp_new\"' EXIT\n";
+    script += "cat > \"$tmp_payload\" <<'" + tag + "'\n";
+    script += payload;
+    script += "\n" + tag + "\n";
+    script += "awk -v begin=\"$begin\" -v end=\"$end\" 'BEGIN { skip = 0 } $0 == begin { skip = 1; next } $0 == end { skip = 0; next } skip == 0 { print }' \"$cfg\" > \"$tmp_clean\"\n";
+    script += "awk -v mode=\"$mode\" -v cstyle=\"$comment_style\" -v cprefix=\"$comment_prefix\" -v cblock_start=\"$block_start\" -v cblock_end=\"$block_end\" '\n";
+    script += "function ltrim(s) { sub(/^[[:space:]]+/, \"\", s); return s }\n";
+    script += "function starts_with(s, p) { return index(s, p) == 1 }\n";
+    script += "function count_char(s, ch,    n, i) { n = 0; for (i = 1; i <= length(s); i++) if (substr(s, i, 1) == ch) n++; return n }\n";
+    script += "function is_noctalia(s) { return index(s, \"NOCTALIA DISPLAY CONFIG\") > 0 || index(s, \"Managed by Noctalia monitor settings\") > 0 }\n";
+    script += "function is_commented(trim) { return cprefix == \"//\" ? starts_with(trim, \"//\") : starts_with(trim, \"#\") }\n";
+    script += "function comment_line(s) { return cprefix \" NOCTALIA_DISABLED_DISPLAY \" s }\n";
+    script += "function is_hypr_line(trim) { return trim ~ /^monitor[[:space:]]*=/ }\n";
+    script += "function is_hypr_block_start(trim) { return trim ~ /^monitorv2[[:space:]]*\\{/ }\n";
+    script += "function is_sway_output_line(trim) { return trim ~ /^output([[:space:]]+\"[^\"]+\"|[[:space:]]+[^[:space:]\\{]+)([[:space:]].*)?$/ }\n";
+    script += "function is_sway_block_start(trim) { return trim ~ /^output([[:space:]]+\"[^\"]+\"|[[:space:]]+[^[:space:]\\{]+)[[:space:]]*\\{/ }\n";
+    script += "function is_niri_spawn_line(trim) { return trim ~ /^spawn-at-startup[[:space:]]+\"[^\"]*niri msg output([[:space:]]|\")/ }\n";
+    script += "function is_niri_block_start(trim) { return trim ~ /^output([[:space:]]+\"[^\"]+\"|[[:space:]]+[^[:space:]\\{]+)[[:space:]]*\\{/ }\n";
+    script += "BEGIN { in_block = 0; depth = 0; comment_open = 0; skip_old_block = 0 }\n";
+    script += "{\n";
+    script += "  line = $0; trim = ltrim(line); opens = count_char(line, \"{\"); closes = count_char(line, \"}\");\n";
+    script += "  if (cstyle == \"block\") {\n";
+    script += "    if (trim == cblock_start) { skip_old_block = 1; next }\n";
+    script += "    if (skip_old_block) { if (trim == cblock_end) skip_old_block = 0; next }\n";
+    script += "  }\n";
+    script += "  if (in_block) {\n";
+    script += "    if (trim != \"\" && !is_noctalia(line)) {\n";
+    script += "      if (cstyle == \"block\") {\n";
+    script += "        if (!comment_open) { print cblock_start; comment_open = 1 }\n";
+    script += "      } else if (!is_commented(trim)) {\n";
+    script += "        line = comment_line(line);\n";
+    script += "      }\n";
+    script += "    }\n";
+    script += "    print line;\n";
+    script += "    depth += opens - closes;\n";
+    script += "    if (depth <= 0) {\n";
+    script += "      if (cstyle == \"block\" && comment_open) { print cblock_end; comment_open = 0 }\n";
+    script += "      in_block = 0;\n";
+    script += "      depth = 0;\n";
+    script += "    }\n";
+    script += "    next;\n";
+    script += "  }\n";
+    script += "  if (trim == \"\" || is_noctalia(line) || (cstyle != \"block\" && is_commented(trim))) { print line; next }\n";
+    script += "  if (mode == \"hyprland\") {\n";
+    script += "    if (is_hypr_block_start(trim)) {\n";
+    script += "      in_block = 1; depth = opens - closes; if (depth <= 0) depth = 1;\n";
+    script += "      if (cstyle == \"block\") { print cblock_start; comment_open = 1; print line; if (depth <= 0) { print cblock_end; comment_open = 0; in_block = 0; depth = 0 } } else { print comment_line(line) }\n";
+    script += "      next\n";
+    script += "    }\n";
+    script += "    if (is_hypr_line(trim)) { if (cstyle == \"block\") { print cblock_start; print line; print cblock_end } else { print comment_line(line) }; next }\n";
+    script += "  } else if (mode == \"sway\") {\n";
+    script += "    if (is_sway_block_start(trim)) {\n";
+    script += "      in_block = 1; depth = opens - closes; if (depth <= 0) depth = 1;\n";
+    script += "      if (cstyle == \"block\") { print cblock_start; comment_open = 1; print line; if (depth <= 0) { print cblock_end; comment_open = 0; in_block = 0; depth = 0 } } else { print comment_line(line) }\n";
+    script += "      next\n";
+    script += "    }\n";
+    script += "    if (is_sway_output_line(trim)) { if (cstyle == \"block\") { print cblock_start; print line; print cblock_end } else { print comment_line(line) }; next }\n";
+    script += "  } else if (mode == \"niri\") {\n";
+    script += "    if (is_niri_block_start(trim)) {\n";
+    script += "      in_block = 1; depth = opens - closes; if (depth <= 0) depth = 1;\n";
+    script += "      if (cstyle == \"block\") { print cblock_start; comment_open = 1; print line; if (depth <= 0) { print cblock_end; comment_open = 0; in_block = 0; depth = 0 } } else { print comment_line(line) }\n";
+    script += "      next\n";
+    script += "    }\n";
+    script += "    if (is_niri_spawn_line(trim)) { if (cstyle == \"block\") { print cblock_start; print line; print cblock_end } else { print comment_line(line) }; next }\n";
+    script += "  }\n";
+    script += "  print line;\n";
+    script += "}\n";
+    script += "' \"$tmp_clean\" > \"$tmp_legacy\"\n";
+    script += "{ cat \"$tmp_legacy\"; printf '\\n%s\\n' \"$begin\"; cat \"$tmp_payload\"; printf '%s\\n' \"$end\"; } > \"$tmp_new\"\n";
+    script += "if cmp -s \"$cfg\" \"$tmp_new\"; then echo \"" + unchangedToken + "\"; exit 0; fi\n";
+    script += "mv \"$tmp_new\" \"$cfg\"\n";
+    script += "echo \"" + savedToken + "\"\n";
+    return script;
+  }
+
+  function persistCurrentConfig() {
+    if (root.awaitingConfirmation) {
+      Logger.i("DisplayManager", "Skip persisting display config while awaiting confirmation");
+      return;
+    }
+
+    if (!isPersistenceSupported()) {
+      Logger.i("DisplayManager", "Skip persistence for unsupported compositor:", root.compositor);
+      return;
+    }
+
+    const backend = getBackend();
+    const path = backend.getPersistenceConfigPath();
+    const payload = backend.buildPersistencePayload(root.targetConfig);
+    const markers = backend.getPersistenceMarkers();
+    const legacyMode = backend.getPersistenceLegacyMode();
+    const commentStyle = backend.getPersistenceLegacyCommentStyle();
+    const commentPrefix = commentStyle === "line" && backend.getPersistenceCommentPrefix ? backend.getPersistenceCommentPrefix() : "";
+    const blockCommentStart = commentStyle === "block" && backend.getPersistenceBlockCommentStart ? backend.getPersistenceBlockCommentStart() : "";
+    const blockCommentEnd = commentStyle === "block" && backend.getPersistenceBlockCommentEnd ? backend.getPersistenceBlockCommentEnd() : "";
+
+    if (!path || !payload || !markers.begin || !markers.end || !legacyMode || !commentStyle
+        || (commentStyle === "line" && !commentPrefix)
+        || (commentStyle === "block" && (!blockCommentStart || !blockCommentEnd))) {
+      Logger.w("DisplayManager", "Display config persistence aborted due to invalid persistence payload");
+      return;
+    }
+
+    root.persistError = "";
+    root.persistDidWrite = false;
+    root.persistRunning = true;
+
+    if (persistProcess.running)
+      persistProcess.running = false;
+
+    persistProcess.command = ["sh", "-c", _buildPersistenceScript(path, markers.begin, markers.end, payload, legacyMode, commentStyle, commentPrefix, blockCommentStart, blockCommentEnd)];
+    persistProcess.running = true;
   }
 
   function _buildFetchScript() {
@@ -947,6 +1106,48 @@ Singleton
         root.edidDecoded = "";
       }
       root.edidLoading = false;
+    }
+  }
+
+  Process {
+    id: persistProcess
+    command: []
+    running: false
+
+    stdout: StdioCollector {
+      onStreamFinished: {
+        const out = text || "";
+        root.persistDidWrite = out.indexOf("__NOCTALIA_PERSIST_SAVED__") >= 0;
+        if (out.indexOf("__NOCTALIA_PERSIST_UNCHANGED__") >= 0)
+          Logger.i("DisplayManager", "Display persistence skipped: managed block unchanged");
+      }
+    }
+
+    stderr: StdioCollector {
+      onStreamFinished: {
+        const err = text.trim();
+        if (err.length > 0) {
+          root.persistError = err;
+          Logger.e("DisplayManager", "Persist display config error:", err);
+        }
+      }
+    }
+
+    onExited: function (exitCode) {
+      root.persistRunning = false;
+      if (exitCode === 0) {
+        if (root.persistDidWrite) {
+          Logger.i("DisplayManager", "Display config persisted to compositor config");
+          ToastService.showNotice(I18n.tr("common.monitor"), "Display configuration saved");
+        }
+      } else if (!root.persistError) {
+        root.persistError = "Failed to persist display config";
+        Logger.e("DisplayManager", "Persist display config failed with exit code:", exitCode);
+      }
+
+      if (exitCode !== 0) {
+        ToastService.showWarning(I18n.tr("common.monitor"), root.persistError || "Failed to save display configuration");
+      }
     }
   }
 }

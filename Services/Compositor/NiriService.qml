@@ -70,6 +70,70 @@ Item {
     parseFetch: function (rawData) {
       const data = {};
 
+      function normalizeRefreshMilli(value) {
+        const r = Number(value);
+        if (!isFinite(r) || r <= 0)
+          return 60000;
+        // Tolerate Hz-style refresh values defensively.
+        return r < 1000 ? Math.round(r * 1000) : Math.round(r);
+      }
+
+      function normalizeModes(mon) {
+        const sourceModes = Array.isArray(mon && mon.modes) ? mon.modes : [];
+        const normalized = [];
+        let currentIdx = -1;
+
+        for (let i = 0; i < sourceModes.length; i++) {
+          const m = sourceModes[i] || {};
+          const entry = {
+            width: Number(m.width) || 0,
+            height: Number(m.height) || 0,
+            refresh_rate: normalizeRefreshMilli(m.refresh_rate !== undefined ? m.refresh_rate : m.refresh)
+          };
+          normalized.push(entry);
+          if (m.is_current === true || m.current === true)
+            currentIdx = normalized.length - 1;
+        }
+
+        const cur = mon ? mon.current_mode : null;
+        if (Number.isInteger(cur) && cur >= 0 && cur < normalized.length) {
+          currentIdx = cur;
+        } else if (cur && typeof cur === "object" && normalized.length > 0) {
+          const cw = Number(cur.width) || 0;
+          const ch = Number(cur.height) || 0;
+          const cr = normalizeRefreshMilli(cur.refresh_rate !== undefined ? cur.refresh_rate : cur.refresh);
+          for (let i = 0; i < normalized.length; i++) {
+            const m = normalized[i];
+            const sameSize = m.width === cw && m.height === ch;
+            const sameRate = Math.abs(m.refresh_rate - cr) < 2;
+            if (sameSize && sameRate) {
+              currentIdx = i;
+              break;
+            }
+          }
+        }
+
+        if (currentIdx < 0 && normalized.length > 0) {
+          const logical = mon && mon.logical ? mon.logical : {};
+          const lw = Number(logical.width) || 0;
+          const lh = Number(logical.height) || 0;
+          for (let i = 0; i < normalized.length; i++) {
+            if (normalized[i].width === lw && normalized[i].height === lh) {
+              currentIdx = i;
+              break;
+            }
+          }
+        }
+
+        if (currentIdx < 0 && normalized.length > 0)
+          currentIdx = 0;
+
+        return {
+          modes: normalized,
+          currentMode: currentIdx
+        };
+      }
+
       function resolveEnabled(mon) {
         if (!mon)
           return false;
@@ -87,6 +151,9 @@ Item {
           const mon = rawData[i];
           if (!mon || !mon.name)
             continue;
+          const normalized = normalizeModes(mon);
+          mon.modes = normalized.modes;
+          mon.current_mode = normalized.currentMode;
           mon.enabled = resolveEnabled(mon);
           data[mon.name] = mon;
         }
@@ -100,6 +167,9 @@ Item {
             continue;
           if (!mon.name)
             mon.name = outputName;
+          const normalized = normalizeModes(mon);
+          mon.modes = normalized.modes;
+          mon.current_mode = normalized.currentMode;
           mon.enabled = resolveEnabled(mon);
           data[mon.name] = mon;
         }
@@ -142,6 +212,100 @@ Item {
         pending.push(["niri", "msg", "output", name, "position", "set", "--", String(Math.round(cfg.x)), String(Math.round(cfg.y))]);
       }
       return pending;
+    },
+    _transformToNiri: function (transform) {
+      const tMap = {
+        "normal": "normal",
+        "Normal": "normal",
+        "90": "90",
+        "180": "180",
+        "270": "270",
+        "flipped": "flipped",
+        "Flipped": "flipped",
+        "flipped-90": "flipped-90",
+        "Flipped90": "flipped-90",
+        "flipped-180": "flipped-180",
+        "Flipped180": "flipped-180",
+        "flipped-270": "flipped-270",
+        "Flipped270": "flipped-270"
+      };
+      return tMap[String(transform || "normal")] || "normal";
+    },
+    _escapeKdlString: function (text) {
+      return String(text || "").replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+    },
+    getPersistenceConfigPath: function () {
+      const xdg = Quickshell.env("XDG_CONFIG_HOME");
+      const home = Quickshell.env("HOME");
+      const base = (xdg && xdg.length > 0) ? xdg : ((home && home.length > 0) ? home + "/.config" : "~/.config");
+      return base + "/niri/config.kdl";
+    },
+    getPersistenceMarkers: function () {
+      return {
+        begin: "// >>> NOCTALIA DISPLAY CONFIG >>>",
+        end: "// <<< NOCTALIA DISPLAY CONFIG <<<"
+      };
+    },
+    getPersistenceLegacyMode: function () {
+      return "niri";
+    },
+    getPersistenceLegacyCommentStyle: function () {
+      return "block";
+    },
+    getPersistenceBlockCommentStart: function () {
+      return "/* NOCTALIA_DISABLED_DISPLAY_BEGIN";
+    },
+    getPersistenceBlockCommentEnd: function () {
+      return "NOCTALIA_DISABLED_DISPLAY_END */";
+    },
+    buildPersistencePayload: function (targetConfig) {
+      const lines = ["// Managed by Noctalia monitor settings."];
+      const names = Object.keys(targetConfig || {}).sort((a, b) => String(a).localeCompare(String(b)));
+
+      function toNiriMode(modeStr) {
+        const raw = String(modeStr || "").trim();
+        if (raw === "")
+          return "preferred";
+        const at = raw.split("@");
+        if (at.length !== 2)
+          return raw;
+        const hz = Number(at[1]);
+        if (!isFinite(hz) || hz <= 0)
+          return raw;
+        return at[0] + "@" + hz.toFixed(3);
+      }
+
+      for (const name of names) {
+        const cfg = targetConfig[name] || {};
+        const outName = this._escapeKdlString(name);
+
+        lines.push("output \"" + outName + "\" {");
+        if (cfg.enabled === false) {
+          lines.push("    off");
+          lines.push("}");
+          lines.push("");
+          continue;
+        }
+
+        const x = Math.round(cfg.x || 0);
+        const y = Math.round(cfg.y || 0);
+        const mode = toNiriMode(cfg.modeStr);
+        const scale = String(cfg.scale !== undefined ? cfg.scale : 1);
+        const transform = this._transformToNiri(cfg.transform);
+
+        lines.push("    mode \"" + this._escapeKdlString(mode) + "\"");
+        lines.push("    scale " + this._escapeKdlString(scale));
+        lines.push("    transform \"" + this._escapeKdlString(transform) + "\"");
+        if (cfg.vrr_enabled !== undefined)
+          lines.push("    variable-refresh-rate on-demand=" + (cfg.vrr_enabled ? "true" : "false"));
+        lines.push("    position x=" + x + " y=" + y);
+        lines.push("}");
+        lines.push("");
+      }
+
+      while (lines.length > 0 && lines[lines.length - 1] === "")
+        lines.pop();
+      return lines.join("\n") + "\n";
     }
   })
 

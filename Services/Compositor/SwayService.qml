@@ -231,6 +231,56 @@ Item {
         pending.push([root.msgCommand, "output", outputName, "position", String(Math.round(cfg.x || 0)), String(Math.round(cfg.y || 0))]);
       }
       return pending;
+    },
+
+    getPersistenceConfigPath: function () {
+      const xdg = Quickshell.env("XDG_CONFIG_HOME");
+      const home = Quickshell.env("HOME");
+      const base = (xdg && xdg.length > 0) ? xdg : ((home && home.length > 0) ? home + "/.config" : "~/.config");
+      return root.msgCommand === "scrollmsg" ? (base + "/scroll/config") : (base + "/sway/config");
+    },
+
+    getPersistenceMarkers: function () {
+      return {
+        begin: "# >>> NOCTALIA DISPLAY CONFIG >>>",
+        end: "# <<< NOCTALIA DISPLAY CONFIG <<<"
+      };
+    },
+    getPersistenceLegacyMode: function () {
+      return "sway";
+    },
+    getPersistenceLegacyCommentStyle: function () {
+      return "line";
+    },
+    getPersistenceCommentPrefix: function () {
+      return "#";
+    },
+
+    buildPersistencePayload: function (targetConfig) {
+      const lines = ["# Managed by Noctalia monitor settings."];
+      if (root.msgCommand === "scrollmsg")
+        lines.push("# Target compositor: Scroll");
+
+      const names = Object.keys(targetConfig || {}).sort((a, b) => String(a).localeCompare(String(b)));
+      for (const outputName of names) {
+        const cfg = targetConfig[outputName] || {};
+        if (cfg.enabled === false) {
+          lines.push("output " + outputName + " disable");
+          continue;
+        }
+
+        const x = Math.round(cfg.x || 0);
+        const y = Math.round(cfg.y || 0);
+        lines.push("output " + outputName + " enable");
+        lines.push("output " + outputName + " mode " + root._modeStrToSway(cfg.modeStr));
+        lines.push("output " + outputName + " scale " + String(cfg.scale !== undefined ? cfg.scale : 1));
+        lines.push("output " + outputName + " transform " + root._transformToSway(cfg.transform));
+        lines.push("output " + outputName + " position " + x + " " + y);
+        if (cfg.vrr_enabled !== undefined)
+          lines.push("output " + outputName + " adaptive_sync " + (cfg.vrr_enabled ? "on" : "off"));
+      }
+
+      return lines.join("\n") + "\n";
     }
   })
 

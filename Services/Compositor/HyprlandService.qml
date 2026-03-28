@@ -145,6 +145,48 @@ Item {
        pending.push(this._buildMonitorCmd(name, cfg));
      }
      return pending;
+   },
+   getPersistenceConfigPath: function() {
+     const xdg = Quickshell.env("XDG_CONFIG_HOME");
+     const home = Quickshell.env("HOME");
+     const base = (xdg && xdg.length > 0) ? xdg : ((home && home.length > 0) ? home + "/.config" : "~/.config");
+     return base + "/hypr/hyprland.conf";
+   },
+   getPersistenceMarkers: function() {
+     return {
+       begin: "# >>> NOCTALIA DISPLAY CONFIG >>>",
+       end: "# <<< NOCTALIA DISPLAY CONFIG <<<"
+     };
+   },
+   getPersistenceLegacyMode: function() {
+     return "hyprland";
+   },
+   getPersistenceLegacyCommentStyle: function() {
+     return "line";
+   },
+   getPersistenceCommentPrefix: function() {
+     return "#";
+   },
+   buildPersistencePayload: function(targetConfig) {
+     const lines = ["# Managed by Noctalia monitor settings."];
+     const names = Object.keys(targetConfig || {}).sort((a, b) => String(a).localeCompare(String(b)));
+
+     for (const name of names) {
+       const cfg = targetConfig[name] || {};
+       if (cfg.enabled === false) {
+         lines.push("monitor=" + name + ",disable");
+         continue;
+       }
+
+       const mode = cfg.modeStr || "preferred";
+       const x = Math.round(cfg.x || 0);
+       const y = Math.round(cfg.y || 0);
+       const scale = cfg.scale !== undefined ? cfg.scale : 1;
+       const transform = this._transformCode(cfg.transform);
+       lines.push("monitor=" + name + "," + mode + "," + x + "x" + y + "," + scale + ",transform," + transform);
+     }
+
+     return lines.join("\n") + "\n";
    }
 })
 

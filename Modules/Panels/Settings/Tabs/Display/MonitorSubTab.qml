@@ -198,6 +198,10 @@ ColumnLayout {
     DisplayService.refresh();
   }
 
+  Component.onDestruction: {
+    DisplayService.persistCurrentConfig();
+  }
+
   NBox {
     Layout.fillWidth: true
     implicitHeight: warningContent.implicitHeight + 2 * Style.marginM
