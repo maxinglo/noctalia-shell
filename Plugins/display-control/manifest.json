@@ -1,0 +1,20 @@
+{
+  "id": "display-control",
+  "name": "Display Control",
+  "version": "1.0.0",
+  "minNoctaliaVersion": "3.6.0",
+  "description": "Monitor layout, mode, scale, VRR and EDID tools",
+  "author": "Noctalia",
+  "license": "MIT",
+  "repository": "https://github.com/noctalia-dev/noctalia-shell",
+  "entryPoints": {
+    "settings": "Settings.qml"
+  },
+  "dependencies": {
+    "plugins": []
+  },
+  "metadata": {
+    "defaultSettings": {}
+  }
+}
+

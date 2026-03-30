@@ -1,0 +1,2248 @@
+import QtQuick
+import Quickshell
+import Quickshell.Io
+import qs.Commons
+import qs.Services.Hardware
+import qs.Services.Compositor
+import qs.Services.UI
+
+Item
+{
+  id: root
+
+  property bool awaitingConfirmation: false
+  property string compositor: "niri"
+  property string error: ""
+  property bool loading: false
+
+  property var outputs: ({})
+  property var outputsList: []
+
+  property var targetConfig: ({})
+
+  property var pendingRevert: null
+  property int revertCountdown: 0
+  readonly property int revertTimeoutSec: 15
+
+  property var commandQueue: []
+
+  property bool edidLoading: false
+  property string edidOutputName: ""
+  property string edidHex: ""
+  property string edidDecoded: ""
+  property string edidError: ""
+  property string edidDecodeError: ""
+  property var edidSummary: ({})
+  property int edidRequestId: 0
+  property bool persistRunning: false
+  property string persistError: ""
+  property bool persistDidWrite: false
+
+  function _getDisplayBackendHint() {
+    if (typeof CompositorService === "undefined") return "fallback";
+    if (CompositorService.isHyprland) return "hyprland";
+    if (CompositorService.isNiri) return "niri";
+    if (CompositorService.isSway) return "sway";
+    return "fallback";
+  }
+
+  function isPersistenceSupported() {
+    const backend = getBackend();
+    if (!backend
+        || !backend.buildPersistencePayload
+        || !backend.getPersistenceConfigPath
+        || !backend.getPersistenceMarkers
+        || !backend.getPersistenceLegacyMode
+        || !backend.getPersistenceLegacyCommentStyle)
+      return false;
+
+    const style = backend.getPersistenceLegacyCommentStyle();
+    if (style === "block")
+      return !!(backend.getPersistenceBlockCommentStart && backend.getPersistenceBlockCommentEnd);
+
+    return !!backend.getPersistenceCommentPrefix;
+  }
+
+  function _shellSingleQuote(text) {
+    return "'" + String(text || "").replace(/'/g, "'\\''") + "'";
+  }
+
+  function _buildPersistenceScript(path, beginMarker, endMarker, payload, legacyMode, commentStyle, commentPrefix, blockCommentStart, blockCommentEnd) {
+    const tag = "NOCTALIA_DISPLAY_PAYLOAD";
+    const savedToken = "__NOCTALIA_PERSIST_SAVED__";
+    const unchangedToken = "__NOCTALIA_PERSIST_UNCHANGED__";
+    let script = "set -eu\n";
+    script += "cfg=" + _shellSingleQuote(path) + "\n";
+    script += "begin=" + _shellSingleQuote(beginMarker) + "\n";
+    script += "end=" + _shellSingleQuote(endMarker) + "\n";
+    script += "mode=" + _shellSingleQuote(legacyMode) + "\n";
+    script += "comment_style=" + _shellSingleQuote(commentStyle || "line") + "\n";
+    script += "comment_prefix=" + _shellSingleQuote(commentPrefix) + "\n";
+    script += "block_start=" + _shellSingleQuote(blockCommentStart || "") + "\n";
+    script += "block_end=" + _shellSingleQuote(blockCommentEnd || "") + "\n";
+    script += "mkdir -p \"$(dirname \"$cfg\")\"\n";
+    script += "touch \"$cfg\"\n";
+    script += "tmp_payload=\"$(mktemp)\"\n";
+    script += "tmp_clean=\"$(mktemp)\"\n";
+    script += "tmp_legacy=\"$(mktemp)\"\n";
+    script += "tmp_new=\"$(mktemp)\"\n";
+    script += "trap 'rm -f \"$tmp_payload\" \"$tmp_clean\" \"$tmp_legacy\" \"$tmp_new\"' EXIT\n";
+    script += "cat > \"$tmp_payload\" <<'" + tag + "'\n";
+    script += payload;
+    script += "\n" + tag + "\n";
+    script += "awk -v begin=\"$begin\" -v end=\"$end\" 'BEGIN { skip = 0 } $0 == begin { skip = 1; next } $0 == end { skip = 0; next } skip == 0 { print }' \"$cfg\" > \"$tmp_clean\"\n";
+    script += "awk -v mode=\"$mode\" -v cstyle=\"$comment_style\" -v cprefix=\"$comment_prefix\" -v cblock_start=\"$block_start\" -v cblock_end=\"$block_end\" '\n";
+    script += "function ltrim(s) { sub(/^[[:space:]]+/, \"\", s); return s }\n";
+    script += "function starts_with(s, p) { return index(s, p) == 1 }\n";
+    script += "function count_char(s, ch,    n, i) { n = 0; for (i = 1; i <= length(s); i++) if (substr(s, i, 1) == ch) n++; return n }\n";
+    script += "function is_noctalia(s) { return index(s, \"NOCTALIA DISPLAY CONFIG\") > 0 || index(s, \"Managed by Noctalia monitor settings\") > 0 }\n";
+    script += "function is_commented(trim) { return cprefix == \"//\" ? starts_with(trim, \"//\") : starts_with(trim, \"#\") }\n";
+    script += "function comment_line(s) { return cprefix \" NOCTALIA_DISABLED_DISPLAY \" s }\n";
+    script += "function is_hypr_line(trim) { return trim ~ /^monitor[[:space:]]*=/ }\n";
+    script += "function is_hypr_block_start(trim) { return trim ~ /^monitorv2[[:space:]]*\\{/ }\n";
+    script += "function is_sway_output_line(trim) { return trim ~ /^output([[:space:]]+\\\"[^\\\"]+\\\"|[[:space:]]+[^[:space:]\\{]+)([[:space:]].*)?$/ }\n";
+    script += "function is_sway_block_start(trim) { return trim ~ /^output([[:space:]]+\\\"[^\\\"]+\\\"|[[:space:]]+[^[:space:]\\{]+)[[:space:]]*\\{/ }\n";
+    script += "function is_niri_spawn_line(trim) { return trim ~ /^spawn-at-startup[[:space:]]+\\\"[^\\\"]*niri msg output([[:space:]]|\\\")/ }\n";
+    script += "function is_niri_block_start(trim) { return trim ~ /^output([[:space:]]+\\\"[^\\\"]+\\\"|[[:space:]]+[^[:space:]\\{]+)[[:space:]]*\\{/ }\n";
+    script += "BEGIN { in_block = 0; depth = 0; comment_open = 0; skip_old_block = 0 }\n";
+    script += "{\n";
+    script += "  line = $0; trim = ltrim(line); opens = count_char(line, \"{\"); closes = count_char(line, \"}\");\n";
+    script += "  if (cstyle == \"block\") {\n";
+    script += "    if (trim == cblock_start) { skip_old_block = 1; next }\n";
+    script += "    if (skip_old_block) { if (trim == cblock_end) skip_old_block = 0; next }\n";
+    script += "  }\n";
+    script += "  if (in_block) {\n";
+    script += "    if (trim != \"\" && !is_noctalia(line)) {\n";
+    script += "      if (cstyle == \"block\") {\n";
+    script += "        if (!comment_open) { print cblock_start; comment_open = 1 }\n";
+    script += "      } else if (!is_commented(trim)) {\n";
+    script += "        line = comment_line(line);\n";
+    script += "      }\n";
+    script += "    }\n";
+    script += "    print line;\n";
+    script += "    depth += opens - closes;\n";
+    script += "    if (depth <= 0) {\n";
+    script += "      if (cstyle == \"block\" && comment_open) { print cblock_end; comment_open = 0 }\n";
+    script += "      in_block = 0;\n";
+    script += "      depth = 0;\n";
+    script += "    }\n";
+    script += "    next;\n";
+    script += "  }\n";
+    script += "  if (trim == \"\" || is_noctalia(line) || (cstyle != \"block\" && is_commented(trim))) { print line; next }\n";
+    script += "  if (mode == \"hyprland\") {\n";
+    script += "    if (is_hypr_block_start(trim)) {\n";
+    script += "      in_block = 1; depth = opens - closes; if (depth <= 0) depth = 1;\n";
+    script += "      if (cstyle == \"block\") { print cblock_start; comment_open = 1; print line; if (depth <= 0) { print cblock_end; comment_open = 0; in_block = 0; depth = 0 } } else { print comment_line(line) }\n";
+    script += "      next\n";
+    script += "    }\n";
+    script += "    if (is_hypr_line(trim)) { if (cstyle == \"block\") { print cblock_start; print line; print cblock_end } else { print comment_line(line) }; next }\n";
+    script += "  } else if (mode == \"sway\") {\n";
+    script += "    if (is_sway_block_start(trim)) {\n";
+    script += "      in_block = 1; depth = opens - closes; if (depth <= 0) depth = 1;\n";
+    script += "      if (cstyle == \"block\") { print cblock_start; comment_open = 1; print line; if (depth <= 0) { print cblock_end; comment_open = 0; in_block = 0; depth = 0 } } else { print comment_line(line) }\n";
+    script += "      next\n";
+    script += "    }\n";
+    script += "    if (is_sway_output_line(trim)) { if (cstyle == \"block\") { print cblock_start; print line; print cblock_end } else { print comment_line(line) }; next }\n";
+    script += "  } else if (mode == \"niri\") {\n";
+    script += "    if (is_niri_block_start(trim)) {\n";
+    script += "      in_block = 1; depth = opens - closes; if (depth <= 0) depth = 1;\n";
+    script += "      if (cstyle == \"block\") { print cblock_start; comment_open = 1; print line; if (depth <= 0) { print cblock_end; comment_open = 0; in_block = 0; depth = 0 } } else { print comment_line(line) }\n";
+    script += "      next\n";
+    script += "    }\n";
+    script += "    if (is_niri_spawn_line(trim)) { if (cstyle == \"block\") { print cblock_start; print line; print cblock_end } else { print comment_line(line) }; next }\n";
+    script += "  }\n";
+    script += "  print line;\n";
+    script += "}\n";
+    script += "' \"$tmp_clean\" > \"$tmp_legacy\"\n";
+    script += "{ cat \"$tmp_legacy\"; printf '\\n%s\\n' \"$begin\"; cat \"$tmp_payload\"; printf '%s\\n' \"$end\"; } > \"$tmp_new\"\n";
+    script += "if cmp -s \"$cfg\" \"$tmp_new\"; then echo \"" + unchangedToken + "\"; exit 0; fi\n";
+    script += "mv \"$tmp_new\" \"$cfg\"\n";
+    script += "echo \"" + savedToken + "\"\n";
+    return script;
+  }
+
+  function persistCurrentConfig() {
+    if (root.awaitingConfirmation) {
+      Logger.i("DisplayManager", "Skip persisting display config while awaiting confirmation");
+      return;
+    }
+
+    if (!isPersistenceSupported()) {
+      Logger.i("DisplayManager", "Skip persistence for unsupported compositor:", root.compositor);
+      return;
+    }
+
+    const backend = getBackend();
+    const path = backend.getPersistenceConfigPath();
+    const payload = backend.buildPersistencePayload(root.targetConfig);
+    const markers = backend.getPersistenceMarkers();
+    const legacyMode = backend.getPersistenceLegacyMode();
+    const commentStyle = backend.getPersistenceLegacyCommentStyle();
+    const commentPrefix = commentStyle === "line" && backend.getPersistenceCommentPrefix ? backend.getPersistenceCommentPrefix() : "";
+    const blockCommentStart = commentStyle === "block" && backend.getPersistenceBlockCommentStart ? backend.getPersistenceBlockCommentStart() : "";
+    const blockCommentEnd = commentStyle === "block" && backend.getPersistenceBlockCommentEnd ? backend.getPersistenceBlockCommentEnd() : "";
+
+    if (!path || !payload || !markers.begin || !markers.end || !legacyMode || !commentStyle
+        || (commentStyle === "line" && !commentPrefix)
+        || (commentStyle === "block" && (!blockCommentStart || !blockCommentEnd))) {
+      Logger.w("DisplayManager", "Display config persistence aborted due to invalid persistence payload");
+      return;
+    }
+
+    root.persistError = "";
+    root.persistDidWrite = false;
+    root.persistRunning = true;
+
+    if (persistProcess.running)
+      persistProcess.running = false;
+
+    persistProcess.command = ["sh", "-c", _buildPersistenceScript(path, markers.begin, markers.end, payload, legacyMode, commentStyle, commentPrefix, blockCommentStart, blockCommentEnd)];
+    persistProcess.running = true;
+  }
+
+  function _joinShell(parts) {
+    return parts.join(" ");
+  }
+
+  function _buildFetchScript() {
+    const hint = _getDisplayBackendHint();
+    const readonlyScript = _buildReadonlyFetchDataScript();
+
+    if (hint === "hyprland") {
+      return _joinShell([
+        'if [ -n "$HYPRLAND_INSTANCE_SIGNATURE" ] && command -v hyprctl >/dev/null 2>&1;',
+        'then printf \'{"compositor":"hyprland", "data":%s}\\n\' "$(hyprctl monitors all -j)";',
+        'else printf \'{"compositor":"hyprland", "data":[]}\\n\';',
+        'fi'
+      ]);
+    }
+
+    if (hint === "niri") {
+      return _joinShell([
+        'if [ -n "$NIRI_SOCKET" ] && command -v niri >/dev/null 2>&1;',
+        'then printf \'{"compositor":"niri", "data":%s}\\n\' "$(niri msg --json outputs)";',
+        'else printf \'{"compositor":"niri", "data":[]}\\n\';',
+        'fi'
+      ]);
+    }
+
+    if (hint === "sway") {
+      return _joinShell([
+        'if [ -n "$SWAYSOCK" ]; then',
+        'msg="swaymsg";',
+        'desk=$(printf "%s" "${XDG_CURRENT_DESKTOP:-}" | tr "[:upper:]" "[:lower:]");',
+        'if printf "%s" "$desk" | grep -q "scroll" && command -v scrollmsg >/dev/null 2>&1; then msg="scrollmsg"; fi;',
+        'if command -v "$msg" >/dev/null 2>&1; then',
+        'printf \'{"compositor":"sway", "data":%s}\\n\' "$("$msg" -t get_outputs -r)";',
+        'else printf \'{"compositor":"sway", "data":[]}\\n\';',
+        'fi;',
+        'else printf \'{"compositor":"sway", "data":[]}\\n\';',
+        'fi'
+      ]);
+    }
+
+    if (hint === "wlroots") {
+      return _joinShell([
+        'if command -v wlr-randr >/dev/null 2>&1 && wlr-randr --json >/dev/null 2>&1;',
+        'then printf \'{"compositor":"wlroots", "data":%s}\\n\' "$(wlr-randr --json)";',
+        'else printf \'{"compositor":"wlroots", "data":[]}\\n\';',
+        'fi'
+      ]);
+    }
+
+    if (hint === "readonly") {
+      return readonlyScript;
+    }
+
+    // Fallback: try generic wlroots tooling, then readonly fallback.
+    return _joinShell([
+      'if command -v wlr-randr >/dev/null 2>&1 && wlr-randr --json >/dev/null 2>&1;',
+      'then printf \'{"compositor":"wlroots", "data":%s}\\n\' "$(wlr-randr --json)";',
+      'else',
+      readonlyScript,
+      'fi'
+    ]);
+  }
+
+  function _buildReadonlyFetchDataScript() {
+    return _joinShell([
+      'outputs="[";',
+      'for dev in /sys/class/drm/card*-*; do',
+      'if [ -e "$dev/status" ] && grep -q "^connected$" "$dev/status" 2>/dev/null; then',
+      'name=$(basename "$dev" | cut -d"-" -f2-);',
+      'mode=""; width=0; height=0;',
+      'if [ -r "$dev/modes" ]; then mode=$(head -n1 "$dev/modes" 2>/dev/null | tr -d "\\r"); fi;',
+      'case "$mode" in [0-9]*x[0-9]*) width=${mode%x*}; height=${mode#*x};; esac;',
+      'outputs+="{\\"name\\":\\"$name\\",\\"enabled\\":true,\\"width\\":$width,\\"height\\":$height},";',
+      'fi;',
+      'done;',
+      'outputs="${outputs%,}]";',
+      'if [ "$outputs" = "]" ]; then outputs="[]"; fi;',
+      'printf \'{"compositor":"readonly", "data":%s}\\n\' "$outputs";'
+    ]);
+  }
+
+  // Normalize backend payloads to an array of output objects.
+  // Some compositors return arrays, others return keyed objects.
+  function _normalizeOutputs(rawData) {
+    if (!rawData)
+      return [];
+
+    if (Array.isArray(rawData))
+      return rawData;
+
+    if (typeof rawData !== "object")
+      return [];
+
+    if (Array.isArray(rawData.outputs))
+      return rawData.outputs;
+
+    if (rawData.outputs && typeof rawData.outputs === "object") {
+      const arr = [];
+      for (const key in rawData.outputs) {
+        const out = rawData.outputs[key];
+        if (out && typeof out === "object" && !out.name)
+          out.name = key;
+        arr.push(out);
+      }
+      return arr;
+    }
+
+    const arr = [];
+    for (const key in rawData) {
+      const out = rawData[key];
+      if (out && typeof out === "object") {
+        if (!out.name)
+          out.name = key;
+        arr.push(out);
+      }
+    }
+    return arr;
+  }
+
+  function _getScreenByOutputName(outputName) {
+    const screens = Quickshell.screens || [];
+    for (let i = 0; i < screens.length; i++) {
+      const screen = screens[i];
+      if (screen && screen.name === outputName)
+        return screen;
+    }
+    return null;
+  }
+
+  function _getDdcModelByOutputName(outputName) {
+    if (typeof BrightnessService === "undefined" || !BrightnessService.ddcMonitors)
+      return "";
+
+    const ddc = BrightnessService.ddcMonitors;
+    for (let i = 0; i < ddc.length; i++) {
+      const entry = ddc[i];
+      if (entry && entry.connector === outputName && entry.model)
+        return String(entry.model);
+    }
+    return "";
+  }
+
+  // Compositor Backends Layer
+  property var _wlrootsBackend: ({
+    _buildFullWlrCmd: function (targetConfig) {
+      let cmd = ["wlr-randr"];
+      for (const name in targetConfig) {
+        const cfg = targetConfig[name];
+
+        cmd.push("--output");
+        cmd.push(name);
+
+        if (cfg.enabled === false) {
+          cmd.push("--off");
+          continue;
+        } else {
+          cmd.push("--on");
+        }
+
+        if (cfg.modeStr) {
+          cmd.push("--mode");
+          cmd.push(cfg.modeStr);
+        }
+        if (cfg.scale !== undefined) {
+          cmd.push("--scale");
+          cmd.push(String(cfg.scale));
+        }
+        if (cfg.transform) {
+          const tMap = {
+            "Normal": "normal",
+            "normal": "normal",
+            "90": "90",
+            "180": "180",
+            "270": "270",
+            "Flipped": "flipped",
+            "flipped": "flipped",
+            "Flipped90": "flipped-90",
+            "flipped-90": "flipped-90",
+            "Flipped180": "flipped-180",
+            "flipped-180": "flipped-180",
+            "Flipped270": "flipped-270",
+            "flipped-270": "flipped-270"
+          };
+          cmd.push("--transform");
+          cmd.push(tMap[cfg.transform] || "normal");
+        }
+        if (cfg.x !== undefined && cfg.y !== undefined) {
+          cmd.push("--pos");
+          cmd.push(Math.round(cfg.x) + "," + Math.round(cfg.y));
+        }
+        if (cfg.vrr_enabled !== undefined) {
+          cmd.push("--adaptive-sync");
+          cmd.push(cfg.vrr_enabled ? "enabled" : "disabled");
+        }
+      }
+      return cmd.length > 1 ? [cmd] : [];
+    },
+    generateRevertCmds: function (snap) {
+      return this._buildFullWlrCmd(snap);
+    },
+    parseFetch: function (rawData) {
+      let data = {};
+      for (let i = 0; i < rawData.length; i++) {
+        const mon = rawData[i];
+
+        let outData = {
+          name: mon.name,
+          enabled: mon.enabled !== false,
+          make: mon.make || "",
+          model: mon.model || "",
+          vrr_enabled: mon.adaptive_sync === true,
+          current_mode: 0,
+          modes: []
+        };
+
+        let curWidth = 1920, curHeight = 1080;
+        for (let j = 0; j < (mon.modes || []).length; j++) {
+          const m = mon.modes[j];
+          outData.modes.push({
+            width: m.width,
+            height: m.height,
+            refresh_rate: Math.round(m.refresh * 1000)
+          });
+          if (m.current) {
+            outData.current_mode = j;
+            curWidth = m.width;
+            curHeight = m.height;
+          }
+        }
+
+        let applyRot = ["90", "270", "flipped-90", "flipped-270"].includes(mon.transform);
+        let physW = applyRot ? curHeight : curWidth;
+        let physH = applyRot ? curWidth : curHeight;
+
+        outData.logical = {
+          x: mon.position ? mon.position.x : 0,
+          y: mon.position ? mon.position.y : 0,
+          width: Math.floor(physW / (mon.scale || 1.0)),
+          height: Math.floor(physH / (mon.scale || 1.0)),
+          scale: mon.scale || 1.0
+        };
+        const tMap = {
+          "normal": "Normal",
+          "90": "90",
+          "180": "180",
+          "270": "270",
+          "flipped": "Flipped",
+          "flipped-90": "Flipped90",
+          "flipped-180": "Flipped180",
+          "flipped-270": "Flipped270"
+        };
+        outData.logical.transform = tMap[mon.transform] || "Normal";
+
+        data[mon.name] = outData;
+      }
+      return data;
+    },
+    buildSetModeCmd: function () {
+      return this._buildFullWlrCmd(root.targetConfig);
+    },
+    buildSetScaleCmd: function () {
+      return this._buildFullWlrCmd(root.targetConfig);
+    },
+    buildSetTransformCmd: function () {
+      return this._buildFullWlrCmd(root.targetConfig);
+    },
+    buildSetVrrCmd: function () {
+      return this._buildFullWlrCmd(root.targetConfig);
+    },
+    buildToggleOutputCmd: function () {
+      return this._buildFullWlrCmd(root.targetConfig);
+    },
+    buildPositionsCmds: function (targetConfig) {
+      return this._buildFullWlrCmd(targetConfig);
+    }
+  })
+
+  // Niri backend copied from the original compositor implementation branch.
+  property var _niriBackend: ({
+    generateRevertCmds: function (snap, curSnap) {
+      let pending = [];
+      let onOffCmds = [];
+      for (const outputName in snap) {
+        const s = snap[outputName];
+        const cur = curSnap[outputName] || {};
+
+        if (s.enabled !== cur.enabled)
+          onOffCmds.push(["niri", "msg", "output", outputName, s.enabled ? "on" : "off"]);
+
+        if (s.enabled === false)
+          continue;
+
+        if (s.modeStr && s.modeStr !== cur.modeStr)
+          pending.push(["niri", "msg", "output", outputName, "mode", s.modeStr]);
+        if (s.scale !== cur.scale)
+          pending.push(["niri", "msg", "output", outputName, "scale", String(s.scale)]);
+        if (s.transform !== cur.transform)
+          pending.push(["niri", "msg", "output", outputName, "transform", this._transformToNiri(s.transform)]);
+        if (Math.round(s.x) !== Math.round(cur.x) || Math.round(s.y) !== Math.round(cur.y))
+          pending.push(["niri", "msg", "output", outputName, "position", "set", "--", String(Math.round(s.x)), String(Math.round(s.y))]);
+        if (s.vrr_enabled !== cur.vrr_enabled)
+          pending.push(["niri", "msg", "output", outputName, "vrr", s.vrr_enabled ? "on" : "off"]);
+      }
+      return onOffCmds.concat(pending);
+    },
+    parseFetch: function (rawData) {
+      const data = {};
+
+      function normalizeRefreshMilli(value) {
+        const r = Number(value);
+        if (!isFinite(r) || r <= 0)
+          return 60000;
+        return r < 1000 ? Math.round(r * 1000) : Math.round(r);
+      }
+
+      function normalizeModes(mon) {
+        const sourceModes = Array.isArray(mon && mon.modes) ? mon.modes : [];
+        const normalized = [];
+        let currentIdx = -1;
+
+        for (let i = 0; i < sourceModes.length; i++) {
+          const m = sourceModes[i] || {};
+          const entry = {
+            width: Number(m.width) || 0,
+            height: Number(m.height) || 0,
+            refresh_rate: normalizeRefreshMilli(m.refresh_rate !== undefined ? m.refresh_rate : m.refresh)
+          };
+          normalized.push(entry);
+          if (m.is_current === true || m.current === true)
+            currentIdx = normalized.length - 1;
+        }
+
+        const cur = mon ? mon.current_mode : null;
+        if (Number.isInteger(cur) && cur >= 0 && cur < normalized.length) {
+          currentIdx = cur;
+        } else if (cur && typeof cur === "object" && normalized.length > 0) {
+          const cw = Number(cur.width) || 0;
+          const ch = Number(cur.height) || 0;
+          const cr = normalizeRefreshMilli(cur.refresh_rate !== undefined ? cur.refresh_rate : cur.refresh);
+          for (let i = 0; i < normalized.length; i++) {
+            const m = normalized[i];
+            if (m.width === cw && m.height === ch && Math.abs(m.refresh_rate - cr) < 2) {
+              currentIdx = i;
+              break;
+            }
+          }
+        }
+
+        if (currentIdx < 0 && normalized.length > 0) {
+          const logical = mon && mon.logical ? mon.logical : {};
+          const lw = Number(logical.width) || 0;
+          const lh = Number(logical.height) || 0;
+          for (let i = 0; i < normalized.length; i++) {
+            if (normalized[i].width === lw && normalized[i].height === lh) {
+              currentIdx = i;
+              break;
+            }
+          }
+        }
+
+        if (currentIdx < 0 && normalized.length > 0)
+          currentIdx = 0;
+
+        return { modes: normalized, currentMode: currentIdx };
+      }
+
+      function resolveEnabled(mon) {
+        if (!mon)
+          return false;
+        if (mon.enabled !== undefined)
+          return mon.enabled !== false;
+        if (mon.active !== undefined)
+          return mon.active === true;
+        if (mon.logical === null || mon.current_mode === null)
+          return false;
+        return true;
+      }
+
+      if (Array.isArray(rawData)) {
+        for (let i = 0; i < rawData.length; i++) {
+          const mon = rawData[i];
+          if (!mon || !mon.name)
+            continue;
+          const normalized = normalizeModes(mon);
+          mon.modes = normalized.modes;
+          mon.current_mode = normalized.currentMode;
+          mon.enabled = resolveEnabled(mon);
+          data[mon.name] = mon;
+        }
+        return data;
+      }
+
+      if (rawData && typeof rawData === "object") {
+        for (const outputName in rawData) {
+          const mon = rawData[outputName];
+          if (!mon)
+            continue;
+          if (!mon.name)
+            mon.name = outputName;
+          const normalized = normalizeModes(mon);
+          mon.modes = normalized.modes;
+          mon.current_mode = normalized.currentMode;
+          mon.enabled = resolveEnabled(mon);
+          data[mon.name] = mon;
+        }
+        return data;
+      }
+
+      return {};
+    },
+    buildSetModeCmd: function (outputName, cfg) {
+      return [["niri", "msg", "output", outputName, "mode", cfg.modeStr]];
+    },
+    buildSetScaleCmd: function (outputName, cfg) {
+      return [["niri", "msg", "output", outputName, "scale", String(cfg.scale)]];
+    },
+    buildSetTransformCmd: function (outputName, cfg) {
+      return [["niri", "msg", "output", outputName, "transform", this._transformToNiri(cfg.transform)]];
+    },
+    buildSetVrrCmd: function (outputName, cfg) {
+      return [["niri", "msg", "output", outputName, "vrr", cfg.vrr_enabled ? "on" : "off"]];
+    },
+    buildToggleOutputCmd: function (outputName, enabled) {
+      return [["niri", "msg", "output", outputName, enabled ? "on" : "off"]];
+    },
+    buildPositionsCmds: function (targetConfig) {
+      let pending = [];
+      for (const name in targetConfig) {
+        const cfg = targetConfig[name];
+        if (cfg.enabled === false)
+          continue;
+        pending.push(["niri", "msg", "output", name, "position", "set", "--", String(Math.round(cfg.x)), String(Math.round(cfg.y))]);
+      }
+      return pending;
+    },
+    _transformToNiri: function (transform) {
+      const tMap = {
+        "normal": "normal",
+        "Normal": "normal",
+        "90": "90",
+        "180": "180",
+        "270": "270",
+        "flipped": "flipped",
+        "Flipped": "flipped",
+        "flipped-90": "flipped-90",
+        "Flipped90": "flipped-90",
+        "flipped-180": "flipped-180",
+        "Flipped180": "flipped-180",
+        "flipped-270": "flipped-270",
+        "Flipped270": "flipped-270"
+      };
+      return tMap[String(transform || "normal")] || "normal";
+    },
+    _escapeKdlString: function (text) {
+      return String(text || "").replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+    },
+    getPersistenceConfigPath: function () {
+      const xdg = Quickshell.env("XDG_CONFIG_HOME");
+      const home = Quickshell.env("HOME");
+      const base = (xdg && xdg.length > 0) ? xdg : ((home && home.length > 0) ? home + "/.config" : "~/.config");
+      return base + "/niri/config.kdl";
+    },
+    getPersistenceMarkers: function () {
+      return {
+        begin: "// >>> NOCTALIA DISPLAY CONFIG >>>",
+        end: "// <<< NOCTALIA DISPLAY CONFIG <<<"
+      };
+    },
+    getPersistenceLegacyMode: function () {
+      return "niri";
+    },
+    getPersistenceLegacyCommentStyle: function () {
+      return "block";
+    },
+    getPersistenceBlockCommentStart: function () {
+      return "/* NOCTALIA_DISABLED_DISPLAY_BEGIN";
+    },
+    getPersistenceBlockCommentEnd: function () {
+      return "NOCTALIA_DISABLED_DISPLAY_END */";
+    },
+    buildPersistencePayload: function (targetConfig) {
+      const lines = ["// Managed by Noctalia monitor settings."];
+      const names = Object.keys(targetConfig || {}).sort((a, b) => String(a).localeCompare(String(b)));
+
+      function toNiriMode(modeStr) {
+        const raw = String(modeStr || "").trim();
+        if (raw === "")
+          return "preferred";
+        const at = raw.split("@");
+        if (at.length !== 2)
+          return raw;
+        const hz = Number(at[1]);
+        if (!isFinite(hz) || hz <= 0)
+          return raw;
+        return at[0] + "@" + hz.toFixed(3);
+      }
+
+      for (const name of names) {
+        const cfg = targetConfig[name] || {};
+        const outName = this._escapeKdlString(name);
+
+        lines.push("output \"" + outName + "\" {");
+        if (cfg.enabled === false) {
+          lines.push("    off");
+          lines.push("}");
+          lines.push("");
+          continue;
+        }
+
+        const x = Math.round(cfg.x || 0);
+        const y = Math.round(cfg.y || 0);
+        const mode = toNiriMode(cfg.modeStr);
+        const scale = String(cfg.scale !== undefined ? cfg.scale : 1);
+        const transform = this._transformToNiri(cfg.transform);
+
+        lines.push("    mode \"" + this._escapeKdlString(mode) + "\"");
+        lines.push("    scale " + this._escapeKdlString(scale));
+        lines.push("    transform \"" + this._escapeKdlString(transform) + "\"");
+        if (cfg.vrr_enabled !== undefined)
+          lines.push("    variable-refresh-rate on-demand=" + (cfg.vrr_enabled ? "true" : "false"));
+        lines.push("    position x=" + x + " y=" + y);
+        lines.push("}");
+        lines.push("");
+      }
+
+      while (lines.length > 0 && lines[lines.length - 1] === "")
+        lines.pop();
+      return lines.join("\n") + "\n";
+    }
+  })
+
+  property var _hyprlandBackend: ({
+    _transformCode: function (transform) {
+      const tMap = {
+        "normal": "0", "Normal": "0",
+        "90": "1", "180": "2", "270": "3",
+        "flipped": "4", "Flipped": "4",
+        "flipped-90": "5", "Flipped90": "5",
+        "flipped-180": "6", "Flipped180": "6",
+        "flipped-270": "7", "Flipped270": "7"
+      };
+      return tMap[transform] || "0";
+    },
+    _buildMonitorCmd: function (outputName, cfg) {
+      const mode = cfg.modeStr || "preferred";
+      const x = Math.round(cfg.x || 0);
+      const y = Math.round(cfg.y || 0);
+      const scale = cfg.scale !== undefined ? cfg.scale : 1;
+      const transform = this._transformCode(cfg.transform);
+      return ["hyprctl", "keyword", "monitor", outputName + "," + mode + "," + x + "x" + y + "," + scale + ",transform," + transform];
+    },
+    generateRevertCmds: function (snap, curSnap) {
+      let pending = [];
+      let onOffCmds = [];
+      for (const outputName in snap) {
+        const s = snap[outputName];
+        const cur = curSnap[outputName] || {};
+
+        if (s.enabled !== cur.enabled) {
+          if (s.enabled === false) {
+            onOffCmds.push(["hyprctl", "keyword", "monitor", outputName + ",disable"]);
+          } else {
+            onOffCmds.push(this._buildMonitorCmd(outputName, s));
+          }
+        }
+
+        if (s.enabled === false)
+          continue;
+
+        if (s.modeStr !== cur.modeStr || s.scale !== cur.scale || Math.round(s.x) !== Math.round(cur.x) || Math.round(s.y) !== Math.round(cur.y))
+          pending.push(this._buildMonitorCmd(outputName, s));
+
+        if (s.transform !== cur.transform)
+          pending.push(this._buildMonitorCmd(outputName, s));
+      }
+      return onOffCmds.concat(pending);
+    },
+    parseFetch: function (rawData) {
+      let data = {};
+      for (let i = 0; i < rawData.length; i++) {
+        const mon = rawData[i];
+        let outData = {
+          name: mon.name,
+          enabled: mon.disabled !== true,
+          logical: {
+            x: mon.x,
+            y: mon.y,
+            width: Math.floor(mon.width / mon.scale),
+            height: Math.floor(mon.height / mon.scale),
+            scale: mon.scale,
+            transform: mon.transform === 1 ? "90"
+              : mon.transform === 2 ? "180"
+              : mon.transform === 3 ? "270"
+              : mon.transform === 4 ? "Flipped"
+              : mon.transform === 5 ? "Flipped90"
+              : mon.transform === 6 ? "Flipped180"
+              : mon.transform === 7 ? "Flipped270"
+              : "Normal"
+          },
+          make: mon.make,
+          model: mon.model,
+          vrr_enabled: mon.vrr,
+          current_mode: 0,
+          modes: []
+        };
+
+        for (let j = 0; j < (mon.availableModes || []).length; j++) {
+          const modeStr = mon.availableModes[j];
+          const parts = modeStr.split('@');
+          if (parts.length === 2) {
+            const dims = parts[0].split('x');
+            let rate = parseFloat(parts[1].replace('Hz', '')) * 1000;
+            outData.modes.push({
+              width: parseInt(dims[0]),
+              height: parseInt(dims[1]),
+              refresh_rate: rate
+            });
+            if (parseInt(dims[0]) === mon.width && parseInt(dims[1]) === mon.height && Math.abs(rate / 1000 - mon.refreshRate) < 1.0)
+              outData.current_mode = outData.modes.length - 1;
+          }
+        }
+        data[mon.name] = outData;
+      }
+      return data;
+    },
+    buildSetModeCmd: function (outputName, cfg) {
+      return [this._buildMonitorCmd(outputName, cfg)];
+    },
+    buildSetScaleCmd: function (outputName, cfg) {
+      return [this._buildMonitorCmd(outputName, cfg)];
+    },
+    buildSetTransformCmd: function (outputName, cfg) {
+      return [this._buildMonitorCmd(outputName, cfg)];
+    },
+    buildSetVrrCmd: function () {
+      return [];
+    },
+    buildToggleOutputCmd: function (outputName, enabled) {
+      return [["hyprctl", "keyword", "monitor", outputName + "," + (enabled ? "preferred,auto,1" : "disable")]];
+    },
+    buildPositionsCmds: function (targetConfig) {
+      let pending = [];
+      for (const name in targetConfig) {
+        const cfg = targetConfig[name];
+        if (cfg.enabled === false)
+          continue;
+        pending.push(this._buildMonitorCmd(name, cfg));
+      }
+      return pending;
+    },
+    getPersistenceConfigPath: function () {
+      const xdg = Quickshell.env("XDG_CONFIG_HOME");
+      const home = Quickshell.env("HOME");
+      const base = (xdg && xdg.length > 0) ? xdg : ((home && home.length > 0) ? home + "/.config" : "~/.config");
+      return base + "/hypr/hyprland.conf";
+    },
+    getPersistenceMarkers: function () {
+      return {
+        begin: "# >>> NOCTALIA DISPLAY CONFIG >>>",
+        end: "# <<< NOCTALIA DISPLAY CONFIG <<<"
+      };
+    },
+    getPersistenceLegacyMode: function () {
+      return "hyprland";
+    },
+    getPersistenceLegacyCommentStyle: function () {
+      return "line";
+    },
+    getPersistenceCommentPrefix: function () {
+      return "#";
+    },
+    buildPersistencePayload: function (targetConfig) {
+      const lines = ["# Managed by Noctalia monitor settings."];
+      const names = Object.keys(targetConfig || {}).sort((a, b) => String(a).localeCompare(String(b)));
+
+      for (const name of names) {
+        const cfg = targetConfig[name] || {};
+        if (cfg.enabled === false) {
+          lines.push("monitor=" + name + ",disable");
+          continue;
+        }
+
+        const mode = cfg.modeStr || "preferred";
+        const x = Math.round(cfg.x || 0);
+        const y = Math.round(cfg.y || 0);
+        const scale = cfg.scale !== undefined ? cfg.scale : 1;
+        const transform = this._transformCode(cfg.transform);
+        lines.push("monitor=" + name + "," + mode + "," + x + "x" + y + "," + scale + ",transform," + transform);
+      }
+
+      return lines.join("\n") + "\n";
+    }
+  })
+
+  property var _swayBackend: ({
+    _getMsgCommand: function () {
+      const desktop = String(Quickshell.env("XDG_CURRENT_DESKTOP") || "").toLowerCase();
+      return desktop.indexOf("scroll") >= 0 ? "scrollmsg" : "swaymsg";
+    },
+    _normalizeRefreshMilli: function (refresh) {
+      const r = Number(refresh);
+      if (!isFinite(r) || r <= 0)
+        return 60000;
+      return r < 1000 ? Math.round(r * 1000) : Math.round(r);
+    },
+    _transformFromSway: function (transform) {
+      const tMap = {
+        "normal": "Normal",
+        "90": "90",
+        "180": "180",
+        "270": "270",
+        "flipped": "Flipped",
+        "flipped-90": "Flipped90",
+        "flipped-180": "Flipped180",
+        "flipped-270": "Flipped270"
+      };
+      return tMap[String(transform || "normal")] || "Normal";
+    },
+    _transformToSway: function (transform) {
+      const tMap = {
+        "normal": "normal",
+        "Normal": "normal",
+        "90": "90",
+        "180": "180",
+        "270": "270",
+        "flipped": "flipped",
+        "Flipped": "flipped",
+        "flipped-90": "flipped-90",
+        "Flipped90": "flipped-90",
+        "flipped-180": "flipped-180",
+        "Flipped180": "flipped-180",
+        "flipped-270": "flipped-270",
+        "Flipped270": "flipped-270"
+      };
+      return tMap[String(transform || "normal")] || "normal";
+    },
+    _modeStrToSway: function (modeStr) {
+      const raw = String(modeStr || "").trim();
+      if (raw === "")
+        return "preferred";
+
+      const at = raw.split("@");
+      if (at.length !== 2)
+        return raw;
+
+      const hz = Number(at[1]);
+      if (!isFinite(hz) || hz <= 0)
+        return raw;
+      return at[0] + "@" + hz.toFixed(3) + "Hz";
+    },
+    _isAdaptiveSyncEnabled: function (output) {
+      if (!output)
+        return false;
+
+      const status = output.adaptive_sync_status;
+      if (typeof status === "boolean")
+        return status;
+      if (status !== undefined && status !== null) {
+        const s = String(status).toLowerCase();
+        return s === "enabled" || s === "on" || s === "true";
+      }
+      return output.adaptive_sync === true;
+    },
+    generateRevertCmds: function (snap, curSnap) {
+      let pending = [];
+      let onOffCmds = [];
+      const msg = this._getMsgCommand();
+
+      for (const outputName in snap) {
+        const s = snap[outputName];
+        const cur = curSnap[outputName] || {};
+
+        if (s.enabled !== cur.enabled)
+          onOffCmds.push([msg, "output", outputName, s.enabled ? "enable" : "disable"]);
+
+        if (s.enabled === false)
+          continue;
+
+        if (s.modeStr && s.modeStr !== cur.modeStr)
+          pending.push([msg, "output", outputName, "mode", this._modeStrToSway(s.modeStr)]);
+        if (Math.abs((s.scale || 1.0) - (cur.scale || 1.0)) > 0.01)
+          pending.push([msg, "output", outputName, "scale", String(s.scale)]);
+        if (s.transform !== cur.transform)
+          pending.push([msg, "output", outputName, "transform", this._transformToSway(s.transform)]);
+        if (Math.round(s.x || 0) !== Math.round(cur.x || 0) || Math.round(s.y || 0) !== Math.round(cur.y || 0))
+          pending.push([msg, "output", outputName, "position", String(Math.round(s.x || 0)), String(Math.round(s.y || 0))]);
+        if (s.vrr_enabled !== cur.vrr_enabled)
+          pending.push([msg, "output", outputName, "adaptive_sync", s.vrr_enabled ? "on" : "off"]);
+      }
+
+      return onOffCmds.concat(pending);
+    },
+    parseFetch: function (rawData) {
+      const data = {};
+      const outputs = Array.isArray(rawData) ? rawData : [];
+
+      for (let i = 0; i < outputs.length; i++) {
+        const mon = outputs[i];
+        if (!mon || !mon.name)
+          continue;
+
+        const isEnabled = mon.active === true || mon.enabled === true;
+        const currentMode = mon.current_mode || {};
+        const modes = [];
+        let currentModeIdx = 0;
+
+        for (let j = 0; j < (mon.modes || []).length; j++) {
+          const m = mon.modes[j];
+          if (!m)
+            continue;
+
+          const modeEntry = {
+            width: Number(m.width) || 0,
+            height: Number(m.height) || 0,
+            refresh_rate: this._normalizeRefreshMilli(m.refresh),
+            is_preferred: m.preferred === true
+          };
+          modes.push(modeEntry);
+
+          const sameAsCurrent = modeEntry.width === (Number(currentMode.width) || 0)
+                               && modeEntry.height === (Number(currentMode.height) || 0)
+                               && Math.abs(modeEntry.refresh_rate - this._normalizeRefreshMilli(currentMode.refresh)) < 2;
+          if (m.current === true || sameAsCurrent)
+            currentModeIdx = modes.length - 1;
+        }
+
+        if (modes.length === 0 && Number(currentMode.width) > 0 && Number(currentMode.height) > 0) {
+          modes.push({
+            width: Number(currentMode.width),
+            height: Number(currentMode.height),
+            refresh_rate: this._normalizeRefreshMilli(currentMode.refresh)
+          });
+          currentModeIdx = 0;
+        }
+
+        const scale = Number(mon.scale) > 0 ? Number(mon.scale) : 1.0;
+        const transform = this._transformFromSway(mon.transform);
+        const applyRot = ["90", "270", "Flipped90", "Flipped270"].includes(transform);
+
+        const modeW = modes[currentModeIdx] ? modes[currentModeIdx].width : 1920;
+        const modeH = modes[currentModeIdx] ? modes[currentModeIdx].height : 1080;
+        const rotatedW = applyRot ? modeH : modeW;
+        const rotatedH = applyRot ? modeW : modeH;
+
+        const rect = mon.rect || {};
+        const logicalWidth = Number(rect.width) > 0 ? Number(rect.width) : Math.floor(rotatedW / scale);
+        const logicalHeight = Number(rect.height) > 0 ? Number(rect.height) : Math.floor(rotatedH / scale);
+
+        data[mon.name] = {
+          name: mon.name,
+          enabled: isEnabled,
+          make: mon.make || "",
+          model: mon.model || "",
+          vrr_enabled: this._isAdaptiveSyncEnabled(mon),
+          current_mode: currentModeIdx,
+          modes: modes,
+          logical: {
+            x: Number(rect.x) || 0,
+            y: Number(rect.y) || 0,
+            width: logicalWidth,
+            height: logicalHeight,
+            scale: scale,
+            transform: transform
+          }
+        };
+      }
+
+      return data;
+    },
+    buildSetModeCmd: function (outputName, cfg) {
+      const msg = this._getMsgCommand();
+      return [[msg, "output", outputName, "mode", this._modeStrToSway(cfg.modeStr)]];
+    },
+    buildSetScaleCmd: function (outputName, cfg) {
+      const msg = this._getMsgCommand();
+      return [[msg, "output", outputName, "scale", String(cfg.scale)]];
+    },
+    buildSetTransformCmd: function (outputName, cfg) {
+      const msg = this._getMsgCommand();
+      return [[msg, "output", outputName, "transform", this._transformToSway(cfg.transform)]];
+    },
+    buildSetVrrCmd: function (outputName, cfg) {
+      const msg = this._getMsgCommand();
+      return [[msg, "output", outputName, "adaptive_sync", cfg.vrr_enabled ? "on" : "off"]];
+    },
+    buildToggleOutputCmd: function (outputName, enabled) {
+      const msg = this._getMsgCommand();
+      return [[msg, "output", outputName, enabled ? "enable" : "disable"]];
+    },
+    buildPositionsCmds: function (targetConfig) {
+      let pending = [];
+      const msg = this._getMsgCommand();
+      for (const outputName in targetConfig) {
+        const cfg = targetConfig[outputName];
+        if (!cfg || cfg.enabled === false)
+          continue;
+        pending.push([msg, "output", outputName, "position", String(Math.round(cfg.x || 0)), String(Math.round(cfg.y || 0))]);
+      }
+      return pending;
+    },
+    getPersistenceConfigPath: function () {
+      const xdg = Quickshell.env("XDG_CONFIG_HOME");
+      const home = Quickshell.env("HOME");
+      const base = (xdg && xdg.length > 0) ? xdg : ((home && home.length > 0) ? home + "/.config" : "~/.config");
+      const msg = this._getMsgCommand();
+      return msg === "scrollmsg" ? (base + "/scroll/config") : (base + "/sway/config");
+    },
+    getPersistenceMarkers: function () {
+      return {
+        begin: "# >>> NOCTALIA DISPLAY CONFIG >>>",
+        end: "# <<< NOCTALIA DISPLAY CONFIG <<<"
+      };
+    },
+    getPersistenceLegacyMode: function () {
+      return "sway";
+    },
+    getPersistenceLegacyCommentStyle: function () {
+      return "line";
+    },
+    getPersistenceCommentPrefix: function () {
+      return "#";
+    },
+    buildPersistencePayload: function (targetConfig) {
+      const lines = ["# Managed by Noctalia monitor settings."];
+      const msg = this._getMsgCommand();
+      if (msg === "scrollmsg")
+        lines.push("# Target compositor: Scroll");
+
+      const names = Object.keys(targetConfig || {}).sort((a, b) => String(a).localeCompare(String(b)));
+      for (const outputName of names) {
+        const cfg = targetConfig[outputName] || {};
+        if (cfg.enabled === false) {
+          lines.push("output " + outputName + " disable");
+          continue;
+        }
+
+        const x = Math.round(cfg.x || 0);
+        const y = Math.round(cfg.y || 0);
+        lines.push("output " + outputName + " enable");
+        lines.push("output " + outputName + " mode " + this._modeStrToSway(cfg.modeStr));
+        lines.push("output " + outputName + " scale " + String(cfg.scale !== undefined ? cfg.scale : 1));
+        lines.push("output " + outputName + " transform " + this._transformToSway(cfg.transform));
+        lines.push("output " + outputName + " position " + x + " " + y);
+        if (cfg.vrr_enabled !== undefined)
+          lines.push("output " + outputName + " adaptive_sync " + (cfg.vrr_enabled ? "on" : "off"));
+      }
+
+      return lines.join("\n") + "\n";
+    }
+  })
+
+  property var _readonlyBackend: ({
+    parseFetch: function (rawData) {
+      rawData = root._normalizeOutputs(rawData);
+      let data = {};
+      for (let i = 0; i < rawData.length; i++) {
+        const mon = rawData[i];
+        if (!mon || typeof mon !== "object")
+          continue;
+
+        const outputName = String(mon.name || mon.output || mon.connector || "");
+        if (outputName === "")
+          continue;
+
+        const screen = root._getScreenByOutputName(outputName);
+        const ddcModel = root._getDdcModelByOutputName(outputName);
+
+        const logical = mon.logical && typeof mon.logical === "object" ? mon.logical : null;
+        const mode = mon.current_mode && typeof mon.current_mode === "object" ? mon.current_mode : null;
+
+        let logicalWidth = parseInt(mon.width || (logical ? logical.width : null) || (mode ? mode.width : null));
+        let logicalHeight = parseInt(mon.height || (logical ? logical.height : null) || (mode ? mode.height : null));
+        if (isNaN(logicalWidth) || logicalWidth <= 0)
+          logicalWidth = screen && screen.width ? screen.width : 1920;
+        if (isNaN(logicalHeight) || logicalHeight <= 0)
+          logicalHeight = screen && screen.height ? screen.height : 1080;
+
+        const model = (screen && screen.model ? String(screen.model) : "") || ddcModel || "Display";
+        data[outputName] = {
+          name: outputName,
+          enabled: mon.enabled !== false,
+          make: "Unknown",
+          model: model,
+          vrr_supported: false,
+          modes: [{width: logicalWidth, height: logicalHeight, refresh_rate: 60000}],
+          current_mode: 0,
+          logical: {x: 0, y: 0, width: logicalWidth, height: logicalHeight, scale: 1.0, transform: "Normal"}
+        };
+      }
+      return data;
+    },
+    generateRevertCmds: function () {
+      return [];
+    },
+    buildSetModeCmd: function () {
+      return [];
+    },
+    buildSetScaleCmd: function () {
+      return [];
+    },
+    buildSetTransformCmd: function () {
+      return [];
+    },
+    buildSetVrrCmd: function () {
+      return [];
+    },
+    buildToggleOutputCmd: function () {
+      return [];
+    },
+    buildPositionsCmds: function () {
+      return [];
+    }
+  })
+
+  function getBackend() {
+    // Keep plugin self-contained across different Noctalia core versions.
+    if (root.compositor === "hyprland")
+      return _hyprlandBackend;
+    if (root.compositor === "niri")
+      return _niriBackend;
+    if (root.compositor === "sway")
+      return _swayBackend;
+    if (root.compositor === "wlroots")
+      return _wlrootsBackend;
+    return _readonlyBackend;
+  }
+
+  // Geometry & Data Model Logic
+  function _clampRange(desired, otherPos, otherSize, dragSize) {
+    return Math.max(otherPos - dragSize + 1, Math.min(desired, otherPos + otherSize - 1));
+  }
+
+  function _isTouching(ax, ay, aw, ah, bx, by, bw, bh) {
+    const tol = 5;
+    if (Math.abs(ax + aw - bx) <= tol && ay < by + bh && ay + ah > by) return true;
+    if (Math.abs(ax - (bx + bw)) <= tol && ay < by + bh && ay + ah > by) return true;
+    if (Math.abs(ay + ah - by) <= tol && ax < bx + bw && ax + aw > bx) return true;
+    if (Math.abs(ay - (by + bh)) <= tol && ax < bx + bw && ax + aw > bx) return true;
+    return false;
+  }
+
+  function _getPredictedSizes(config) {
+    const sizes = {};
+    for (const out of root.outputsList) {
+      const name = out.name;
+      const cfg = config[name] || {};
+
+      let physW = 1920, physH = 1080;
+      if (cfg.enabled === false) {
+        sizes[name] = {w: 0, h: 0};
+        continue;
+      }
+      if (cfg.modeStr) {
+        const parts = cfg.modeStr.split('@')[0].split('x');
+        if (parts.length === 2) {
+          physW = parseInt(parts[0]);
+          physH = parseInt(parts[1]);
+        }
+      } else if (out.modes && out.modes[out.current_mode]) {
+        physW = out.modes[out.current_mode].width;
+        physH = out.modes[out.current_mode].height;
+      }
+
+      const t = cfg.transform || (out.logical ? out.logical.transform : "Normal");
+      const applyRot = ["90", "270", "Flipped90", "Flipped270"].includes(t);
+      const w = applyRot ? physH : physW;
+      const h = applyRot ? physW : physH;
+
+      const s = cfg.scale || (out.logical ? out.logical.scale : 1.0);
+      sizes[name] = {w: Math.floor(w / s), h: Math.floor(h / s)};
+    }
+    return sizes;
+  }
+
+  function _normalizeLayoutEnforceAdjacency() {
+    // Predict per-output logical sizes after pending mode/scale/transform changes.
+    const sizes = _getPredictedSizes(root.targetConfig);
+    const positions = {};
+    const names = [];
+    for (const name in root.targetConfig) {
+      if (root.targetConfig[name] && root.targetConfig[name].enabled !== false) {
+        positions[name] = {x: root.targetConfig[name].x, y: root.targetConfig[name].y};
+        names.push(name);
+      }
+    }
+
+    if (names.length <= 1) return;
+
+    let changed = true;
+    let iter = 0;
+    // Reconnect disconnected components by moving the smallest-distance component edge.
+    while (changed && iter < 5) {
+      changed = false;
+      iter++;
+
+      let components = [];
+      for (const name of names) {
+        let foundComps = [];
+        for (let i = 0; i < components.length; i++) {
+          for (const other of components[i]) {
+            if (_isTouching(positions[name].x, positions[name].y, sizes[name].w, sizes[name].h,
+                positions[other].x, positions[other].y, sizes[other].w, sizes[other].h)) {
+              foundComps.push(i);
+              break;
+            }
+          }
+        }
+        if (foundComps.length === 0) {
+          components.push([name]);
+        } else {
+          let targetComp = components[foundComps[0]];
+          targetComp.push(name);
+          for (let j = 1; j < foundComps.length; j++) {
+            for (const item of components[foundComps[j]]) targetComp.push(item);
+            components[foundComps[j]] = [];
+          }
+          components = components.filter(c => c.length > 0);
+        }
+      }
+
+      if (components.length > 1) {
+        const mainComp = components[0];
+        let bestDist = Infinity;
+        let bestMove = null;
+
+        for (let i = 1; i < components.length; i++) {
+          const comp = components[i];
+          for (const target of comp) {
+            for (const mainNode of mainComp) {
+              const dp = positions[target];
+              const ds = sizes[target];
+              const op = positions[mainNode];
+              const os = sizes[mainNode];
+
+              const candidates = [
+                {x: op.x + os.w, y: _clampRange(dp.y, op.y, os.h, ds.h)},
+                {x: op.x - ds.w, y: _clampRange(dp.y, op.y, os.h, ds.h)},
+                {x: _clampRange(dp.x, op.x, os.w, ds.w), y: op.y + os.h},
+                {x: _clampRange(dp.x, op.x, os.w, ds.w), y: op.y - ds.h}
+              ];
+
+              for (const c of candidates) {
+                const dist = Math.pow(c.x - dp.x, 2) + Math.pow(c.y - dp.y, 2);
+                if (dist < bestDist) {
+                  bestDist = dist;
+                  bestMove = {compIdx: i, dx: c.x - dp.x, dy: c.y - dp.y};
+                }
+              }
+            }
+          }
+        }
+
+        if (bestMove) {
+          const idx = bestMove.compIdx;
+          for (const node of components[idx]) {
+            positions[node].x += bestMove.dx;
+            positions[node].y += bestMove.dy;
+          }
+          changed = true;
+        }
+      }
+    }
+
+    let minX = Infinity, minY = Infinity;
+    for (const name in positions) {
+      minX = Math.min(minX, positions[name].x);
+      minY = Math.min(minY, positions[name].y);
+    }
+
+    // Rebase the layout so the top-left visible output starts at (0, 0).
+    let newConfig = {};
+    for (const name in root.targetConfig) {
+      newConfig[name] = Object.assign({}, root.targetConfig[name]);
+      if (positions[name]) {
+        newConfig[name].x = Math.round(positions[name].x - minX);
+        newConfig[name].y = Math.round(positions[name].y - minY);
+      }
+      if (sizes[name]) {
+        newConfig[name].logicalWidth = sizes[name].w;
+        newConfig[name].logicalHeight = sizes[name].h;
+      }
+    }
+    root.targetConfig = newConfig;
+  }
+
+  function _applyTopologyChange(snap, cmds) {
+    if (!_hasChangesComparedToCurrent()) {
+      Logger.i("DisplayManager", "Topology change resulted in no actual changes. Ignoring.");
+      return;
+    }
+
+    let allCmds = [];
+    for (const c of cmds) allCmds.push(c);
+
+    // Hyprland monitor transform keywords already carry position updates.
+    const hasHyprTransformCmd = root.compositor === "hyprland" && allCmds.some(c => c && c.length >= 4 && c[0] === "hyprctl" && c[1] === "keyword" && c[2] === "monitor" && String(c[3]).indexOf(",transform,") >= 0);
+
+    if (root.compositor !== "wlroots" && !hasHyprTransformCmd) {
+      // For non-wlroots backends, append explicit position commands once per unique command.
+      const posCmds = getBackend().buildPositionsCmds(root.targetConfig);
+      for (const pc of posCmds) {
+        let duplicate = false;
+        for (const c of allCmds) {
+          if (c.join(" ") === pc.join(" ")) {
+            duplicate = true;
+            break;
+          }
+        }
+        if (!duplicate) allCmds.push(pc);
+      }
+    }
+
+    for (const c of allCmds) enqueueCommand(c, snap);
+  }
+
+  function _countEnabledOutputs(config) {
+    let count = 0;
+    if (!config) return count;
+    for (const name in config) {
+      const cfg = config[name];
+      if (cfg && cfg.enabled !== false) count++;
+    }
+    return count;
+  }
+
+  function _buildCurrentState(previousState) {
+    const snap = {};
+    for (const outputName in root.outputs) {
+      const out = root.outputs[outputName];
+      const prev = previousState && previousState[outputName] ? previousState[outputName] : null;
+      let modeStr = null;
+      if (out.modes && out.modes[out.current_mode]) {
+        const m = out.modes[out.current_mode];
+        modeStr = m.width + "x" + m.height + "@" + (m.refresh_rate / 1000).toFixed(3);
+      }
+      if (!modeStr && prev && prev.modeStr) modeStr = prev.modeStr;
+
+      const logical = out.logical || {};
+      snap[outputName] = {
+        modeStr: modeStr,
+        enabled: out.enabled !== false,
+        scale: logical.scale !== undefined ? logical.scale : (prev ? prev.scale : 1.0),
+        transform: logical.transform !== undefined ? logical.transform : (prev ? prev.transform : "Normal"),
+        x: logical.x !== undefined ? logical.x : (prev ? prev.x : 0),
+        y: logical.y !== undefined ? logical.y : (prev ? prev.y : 0),
+        logicalWidth: logical.width !== undefined ? logical.width : (prev ? prev.logicalWidth : 1920),
+        logicalHeight: logical.height !== undefined ? logical.height : (prev ? prev.logicalHeight : 1080),
+        vrr_enabled: out.vrr_enabled !== undefined ? out.vrr_enabled : (prev ? prev.vrr_enabled : false)
+      };
+    }
+    return snap;
+  }
+
+  function snapshotAllOutputs() {
+    return _buildCurrentState();
+  }
+
+  function _hasChangesComparedToCurrent() {
+    const cur = _buildCurrentState();
+    for (const name in cur) {
+      const sc = cur[name];
+      const tc = root.targetConfig[name];
+      if (!tc) continue;
+      if (sc.enabled !== tc.enabled) return true;
+      if (sc.modeStr !== tc.modeStr) return true;
+      if (Math.abs(sc.scale - tc.scale) > 0.01) return true;
+      if (sc.transform !== tc.transform) return true;
+      if (Math.round(sc.x) !== Math.round(tc.x)) return true;
+      if (Math.round(sc.y) !== Math.round(tc.y)) return true;
+      if (sc.vrr_enabled !== tc.vrr_enabled) return true;
+    }
+    return false;
+  }
+
+  // Snapshot & Revert Logic
+  function startConfirmation(snapshot) {
+    if (!root.awaitingConfirmation) {
+      root.pendingRevert = snapshot;
+      root.revertCountdown = root.revertTimeoutSec;
+      root.awaitingConfirmation = true;
+    }
+  }
+
+  function confirmChange() {
+    root.awaitingConfirmation = false;
+    root.pendingRevert = null;
+    root.revertCountdown = 0;
+  }
+
+  function doRevert() {
+    root.awaitingConfirmation = false;
+    root.revertCountdown = 0;
+    const snap = root.pendingRevert;
+    root.pendingRevert = null;
+    if (!snap) return;
+
+    Logger.i("DisplayManager", "Reverting all outputs to previous snapshot");
+
+    root.commandQueue = [];
+
+    const curSnap = snapshotAllOutputs();
+    const cmds = getBackend().generateRevertCmds(snap, curSnap);
+    for (const cmd of cmds) {
+      enqueueCommand(cmd, null);
+    }
+  }
+
+  Timer {
+    id: revertTimer
+    interval: 1000
+    repeat: true
+    running: root.awaitingConfirmation
+    onTriggered: {
+      root.revertCountdown--;
+      if (root.revertCountdown <= 0) {
+        root.doRevert();
+      }
+    }
+  }
+
+  // Action Queue
+  function enqueueCommand(cmd, snapshot) {
+    if (cmd === null || cmd === undefined) return;
+    let q = root.commandQueue;
+    q.push(cmd);
+    root.commandQueue = q;
+
+    if (snapshot) startConfirmation(snapshot);
+    root.processNextCommand();
+  }
+
+  Timer {
+    id: queueSleepTimer
+    repeat: false
+    onTriggered: {
+      root.processNextCommand();
+    }
+  }
+
+  function processNextCommand() {
+    if (!applyCommandProcess.running && !queueSleepTimer.running && root.commandQueue.length > 0) {
+      let q = root.commandQueue;
+      const nextCmd = q.shift();
+      root.commandQueue = q;
+
+      if (typeof nextCmd === "number") {
+        queueSleepTimer.interval = nextCmd;
+        queueSleepTimer.start();
+      } else if (nextCmd && nextCmd.length > 0) {
+        Logger.i("DisplayManager", "Queuing:", nextCmd.join(" "));
+        applyCommandProcess.cmd = nextCmd;
+        applyCommandProcess.running = true;
+      } else {
+        root.processNextCommand();
+      }
+    }
+  }
+
+  Timer {
+    id: finishTimer
+    interval: 50
+    repeat: false
+    onTriggered: {
+      if (root.commandQueue.length > 0) {
+        root.processNextCommand();
+      } else {
+        root.persistCurrentConfig();
+        revertRefreshTimer.start();
+      }
+    }
+  }
+
+  Timer {
+    id: revertRefreshTimer
+    interval: 300
+    repeat: false
+    onTriggered: root.refresh()
+  }
+
+  Process {
+    id: applyCommandProcess
+    property var cmd: []
+    command: cmd
+    running: false
+
+    onRunningChanged: {
+      if (!running) {
+        finishTimer.start();
+      }
+    }
+
+    stderr: StdioCollector {
+      onStreamFinished: {
+        if (text.trim()) {
+          Logger.e("DisplayManager", "Apply error:", text);
+          root.error = text.trim();
+          root.commandQueue = []; // HALT ON ERROR
+        }
+      }
+    }
+    stdout: StdioCollector {
+      onStreamFinished: {
+        Logger.i("DisplayManager", "Apply output:", text);
+      }
+    }
+  }
+
+  // Public APIs
+  function refresh() {
+    root.loading = true;
+    root.error = "";
+    fetchProcess.running = true;
+  }
+
+  function _makeEmptyEdidSummary(outputName) {
+    return {
+      output: String(outputName || ""),
+      source: "",
+      parseStatus: "idle",
+      monitorName: "",
+      manufacturerId: "",
+      productCode: "",
+      serialText: "",
+      serialNumber: "",
+      week: null,
+      year: null,
+      version: "",
+      inputType: "",
+      sizeCm: {width: null, height: null},
+      preferredMode: "",
+      warnings: []
+    };
+  }
+
+  function _extractEdidField(text, patterns) {
+    for (let i = 0; i < patterns.length; i++) {
+      const m = String(text || "").match(patterns[i]);
+      if (!m) continue;
+      for (let j = 1; j < m.length; j++) {
+        if (m[j] !== undefined && String(m[j]).trim() !== "")
+          return String(m[j]).trim();
+      }
+    }
+    return "";
+  }
+
+  function _splitDecodedEdidOutput(rawText) {
+    const marker = "__EDID_SOURCE__:";
+    const full = String(rawText || "").trim();
+    if (full.indexOf(marker) !== 0)
+      return {source: "", text: full};
+
+    const lines = full.split("\n");
+    const firstLine = lines.shift() || "";
+    return {
+      source: firstLine.slice(marker.length).trim(),
+      text: lines.join("\n").trim()
+    };
+  }
+
+  function _buildEdidSummary(decodedText, outputName, source, parseStatus) {
+    const text = String(decodedText || "");
+    const summary = _makeEmptyEdidSummary(outputName);
+    summary.source = String(source || "");
+    summary.parseStatus = String(parseStatus || "decoded");
+
+    if (text.trim() === "")
+      return summary;
+
+    summary.monitorName = _extractEdidField(text, [
+      /Display Product Name:\s*'?([^'\n\r]+)'?/i,
+      /Monitor name:\s*([^\n\r]+)/i,
+      /ModelName\s+"([^"]+)"/i
+    ]);
+
+    summary.manufacturerId = _extractEdidField(text, [
+      /Manufacturer:\s*([A-Za-z0-9]+)/i,
+      /VendorName\s+"([^"]+)"/i
+    ]);
+
+    summary.productCode = _extractEdidField(text, [
+      /Model:\s*([^\n\r]+)/i,
+      /Product(?:\s+ID|\s+Code)\s*:\s*([^\n\r]+)/i,
+      /Model\s+0x([0-9a-f]+)/i
+    ]);
+
+    summary.serialText = _extractEdidField(text, [
+      /Display Product Serial Number:\s*'?([^'\n\r]+)'?/i,
+      /Serial Number:\s*([^\n\r]+)/i,
+      /Serial Number\s+"([^"]+)"/i,
+      /Identifier\s+"([^"]+)"/i
+    ]);
+
+    summary.serialNumber = _extractEdidField(text, [
+      /Serial number:\s*([^\n\r]+)/i
+    ]);
+
+    summary.version = _extractEdidField(text, [
+      /EDID.*?Version[^\n\r:]*:\s*([0-9]+\.[0-9]+)/i,
+      /EDID(?:\s+Version)?\s*:?\s*([0-9]+\.[0-9]+)/i
+    ]);
+
+    summary.inputType = _extractEdidField(text, [
+      /((?:Digital|Analog)\s+display)/i,
+      /([A-Za-z0-9-]+\s+interface)/i,
+      /Input type:\s*([^\n\r]+)/i
+    ]);
+
+    summary.preferredMode = _extractEdidField(text, [
+      /DTD\s+1:\s*([^\n\r]+)/i,
+      /Preferred\s+timing[^\n\r]*?:\s*([^\n\r]+)/i,
+      /Preferred mode:\s*([^\n\r]+)/i,
+      /Modeline\s+"([^"]+)"/i
+    ]);
+
+    if (summary.preferredMode) {
+      summary.preferredMode = summary.preferredMode.replace(/\s{2,}/g, ' ').trim();
+    }
+
+    const madeMatch = text.match(/Made\s+in:\s+week\s+([0-9]+)\s+of\s+([0-9]{4})/i);
+    if (madeMatch) {
+      const weekNum = parseInt(madeMatch[1], 10);
+      const yearNum = parseInt(madeMatch[2], 10);
+      summary.week = isNaN(weekNum) ? null : weekNum;
+      summary.year = isNaN(yearNum) ? null : yearNum;
+    } else {
+      const weekNum = parseInt(_extractEdidField(text, [/Manufacture\s+week:\s*([0-9]+)/i]), 10);
+      const yearNum = parseInt(_extractEdidField(text, [/Manufacture\s+year:\s*([0-9]{4})/i]), 10);
+      summary.week = isNaN(weekNum) ? null : weekNum;
+      summary.year = isNaN(yearNum) ? null : yearNum;
+    }
+
+    const sizeCm = text.match(/Maximum\s+image\s+size:\s*([0-9]+)\s*cm\s*x\s*([0-9]+)\s*cm/i);
+    if (sizeCm) {
+      summary.sizeCm.width = parseInt(sizeCm[1], 10);
+      summary.sizeCm.height = parseInt(sizeCm[2], 10);
+    } else {
+      const sizeMm = text.match(/DisplaySize\s+([0-9]+)\s+([0-9]+)/i);
+      if (sizeMm) {
+        const widthMm = parseInt(sizeMm[1], 10);
+        const heightMm = parseInt(sizeMm[2], 10);
+        if (!isNaN(widthMm) && !isNaN(heightMm)) {
+          summary.sizeCm.width = Math.round(widthMm / 10);
+          summary.sizeCm.height = Math.round(heightMm / 10);
+        }
+      }
+    }
+
+    const warnings = [];
+    const lines = text.split(/\r?\n/);
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i].trim();
+      if (line !== "" && /(warning|fail)/i.test(line)) {
+        warnings.push(line);
+        if (warnings.length >= 5)
+          break;
+      }
+    }
+    summary.warnings = warnings;
+
+    return summary;
+  }
+
+  function _startEdidDecode(rawHex, outputName, requestId) {
+    const normalizedHex = String(rawHex || "").replace(/\s+/g, "").toLowerCase();
+    root.edidDecoded = "";
+    root.edidDecodeError = "";
+    root.edidSummary = _makeEmptyEdidSummary(outputName);
+    root.edidSummary.parseStatus = "decoding";
+
+    if (normalizedHex === "") {
+      root.edidDecodeError = "Empty EDID payload";
+      root.edidSummary.parseStatus = "decode_error";
+      root.edidLoading = false;
+      return;
+    }
+
+    if (edidDecodeProcess.running)
+      edidDecodeProcess.running = false;
+
+    edidDecodeProcess.requestId = requestId;
+    edidDecodeProcess.outputName = outputName;
+    edidDecodeProcess.decodedStdout = "";
+    edidDecodeProcess.decodeStderr = "";
+    const pythonHexDecoder =
+      'if ! python3 - "$hex" "$tmp" <<"PY"\n' +
+      'import pathlib\n' +
+      'import sys\n' +
+      'hex_data = sys.argv[1].strip()\n' +
+      'out_path = pathlib.Path(sys.argv[2])\n' +
+      'try:\n' +
+      '    out_path.write_bytes(bytes.fromhex(hex_data))\n' +
+      'except ValueError:\n' +
+      '    sys.exit(1)\n' +
+      'PY\n' +
+      'then echo "Failed to decode EDID hex" >&2; exit 2; fi;';
+    const decodeScript = _joinShell([
+      'hex=$(printf "%s" "$1" | tr -d "[:space:]");',
+      'if [ -z "$hex" ]; then echo "Empty EDID hex payload" >&2; exit 1; fi;',
+      'tmp=$(mktemp);',
+      'cleanup(){ rm -f "$tmp"; };',
+      'trap cleanup EXIT;',
+      'if command -v xxd >/dev/null 2>&1; then',
+      'if ! printf "%s" "$hex" | xxd -r -p > "$tmp" 2>/dev/null; then echo "Failed to decode EDID hex" >&2; exit 2; fi;',
+      'elif command -v python3 >/dev/null 2>&1; then',
+      pythonHexDecoder,
+      'else echo "Need xxd or python3 to decode EDID hex" >&2; exit 3; fi;',
+      'if command -v edid-decode >/dev/null 2>&1; then',
+      'echo "__EDID_SOURCE__:edid-decode"; edid-decode "$tmp";',
+      'elif command -v parse-edid >/dev/null 2>&1; then',
+      'echo "__EDID_SOURCE__:parse-edid"; parse-edid < "$tmp";',
+      'else echo "No external EDID decoder found (install edid-decode or parse-edid)" >&2; exit 127; fi'
+    ]);
+    edidDecodeProcess.command = [
+      "bash",
+      "-c",
+      decodeScript,
+      "sh",
+      normalizedHex
+    ];
+    edidDecodeProcess.running = true;
+  }
+
+  function readEdid(outputName) {
+    const out = String(outputName || "").trim();
+    if (out === "") {
+      root.edidError = "Invalid output name";
+      root.edidHex = "";
+      root.edidDecoded = "";
+      root.edidDecodeError = "";
+      root.edidSummary = _makeEmptyEdidSummary("");
+      root.edidSummary.parseStatus = "read_error";
+      root.edidLoading = false;
+      return;
+    }
+
+    root.edidRequestId++;
+    const requestId = root.edidRequestId;
+
+    root.edidOutputName = out;
+    root.edidHex = "";
+    root.edidDecoded = "";
+    root.edidError = "";
+    root.edidDecodeError = "";
+    root.edidSummary = _makeEmptyEdidSummary(out);
+    root.edidSummary.parseStatus = "loading";
+    root.edidLoading = true;
+
+    if (edidReadProcess.running)
+      edidReadProcess.running = false;
+    if (edidDecodeProcess.running)
+      edidDecodeProcess.running = false;
+
+    edidReadProcess.requestId = requestId;
+    edidReadProcess.outputName = out;
+    edidReadProcess.rawHex = "";
+    edidReadProcess.readStderr = "";
+    const readScript = _joinShell([
+      'name="$1"; path="";',
+      'for p in /sys/class/drm/card*-"$name"/edid; do if [ -r "$p" ]; then path="$p"; break; fi; done;',
+      'if [ -z "$path" ]; then echo "EDID file not found for output: $name" >&2; exit 1; fi;',
+      'if command -v xxd >/dev/null 2>&1; then',
+      'xxd -p -c 32 "$path";',
+      'elif command -v hexdump >/dev/null 2>&1; then',
+      'hexdump -ve "1/1 \\"%02x\\"" "$path";',
+      'else od -An -tx1 -v "$path" | tr -d " \\n"; fi'
+    ]);
+    edidReadProcess.command = [
+      "bash",
+      "-c",
+      readScript,
+      "sh",
+      out
+    ];
+    edidReadProcess.running = true;
+  }
+
+  function setMode(outputName, modeStr) {
+    if (!root.targetConfig[outputName]) return;
+    const snap = root.pendingRevert ? root.pendingRevert : snapshotAllOutputs();
+    root.targetConfig[outputName].modeStr = modeStr;
+    _normalizeLayoutEnforceAdjacency();
+    const cmds = getBackend().buildSetModeCmd(outputName, root.targetConfig[outputName]);
+    _applyTopologyChange(snap, cmds);
+  }
+
+  function setPositionNormalized(draggedOutput, newX, newY) {
+    if (_countEnabledOutputs(root.targetConfig) <= 1) {
+      return;
+    }
+
+    const outputs = root.outputsList;
+    if (!outputs || outputs.length === 0) return;
+
+    // Build a temporary topology using current logical rectangles plus dragged target.
+    const positions = {};
+    const sizes = {};
+    for (const out of outputs) {
+      const lw = out.logical ? out.logical.width : 1920;
+      const lh = out.logical ? out.logical.height : 1080;
+      sizes[out.name] = {w: lw, h: lh};
+      if (out.name === draggedOutput) {
+        positions[out.name] = {x: Math.round(newX), y: Math.round(newY)};
+      } else {
+        positions[out.name] = {x: out.logical ? out.logical.x : 0, y: out.logical ? out.logical.y : 0};
+      }
+    }
+
+    if (Object.keys(positions).length > 1) {
+      const dp = positions[draggedOutput];
+      const ds = sizes[draggedOutput];
+      let touching = false;
+
+      for (const name in positions) {
+        if (name === draggedOutput) continue;
+        if (_isTouching(dp.x, dp.y, ds.w, ds.h, positions[name].x, positions[name].y, sizes[name].w, sizes[name].h)) {
+          touching = true;
+          break;
+        }
+      }
+
+      // If detached, snap the dragged output to the nearest touching edge of any sibling.
+      if (!touching) {
+        let bestDist = Infinity;
+        let bestPos = {x: dp.x, y: dp.y};
+
+        for (const name in positions) {
+          if (name === draggedOutput) continue;
+          const op = positions[name];
+          const os = sizes[name];
+
+          const candidates = [
+            {x: op.x + os.w, y: _clampRange(dp.y, op.y, os.h, ds.h)},
+            {x: op.x - ds.w, y: _clampRange(dp.y, op.y, os.h, ds.h)},
+            {x: _clampRange(dp.x, op.x, os.w, ds.w), y: op.y + os.h},
+            {x: _clampRange(dp.x, op.x, os.w, ds.w), y: op.y - ds.h}
+          ];
+
+          for (const c of candidates) {
+            const dist = Math.pow(c.x - dp.x, 2) + Math.pow(c.y - dp.y, 2);
+            if (dist < bestDist) {
+              bestDist = dist;
+              bestPos = c;
+            }
+          }
+        }
+
+        positions[draggedOutput] = {x: Math.round(bestPos.x), y: Math.round(bestPos.y)};
+        Logger.i("DisplayManager", "Adjacency enforced: moved", draggedOutput, "to", bestPos.x, bestPos.y);
+      }
+    }
+
+    // Normalize all coordinates back into a non-negative layout space.
+    let minX = Infinity, minY = Infinity;
+    for (const name in positions) {
+      minX = Math.min(minX, positions[name].x);
+      minY = Math.min(minY, positions[name].y);
+    }
+
+    // Apply global minimum constraints and update target model
+    let newConfig = {};
+    for (const name in root.targetConfig) {
+      newConfig[name] = Object.assign({}, root.targetConfig[name]);
+      if (positions[name]) {
+        newConfig[name].x = positions[name].x - minX;
+        newConfig[name].y = positions[name].y - minY;
+      }
+      if (sizes[name]) {
+        newConfig[name].logicalWidth = sizes[name].w;
+        newConfig[name].logicalHeight = sizes[name].h;
+      }
+    }
+    root.targetConfig = newConfig;
+
+    if (!_hasChangesComparedToCurrent()) {
+      Logger.i("DisplayManager", "Position normalization resulted in no changes.");
+      return;
+    }
+
+    const snap = root.pendingRevert ? root.pendingRevert : snapshotAllOutputs();
+    const cmds = getBackend().buildPositionsCmds(root.targetConfig);
+    for (const c of cmds) enqueueCommand(c, snap);
+
+    if (root.compositor === "hyprland" || root.compositor === "wlroots") {
+      enqueueCommand(250, null);
+      for (const c of cmds) enqueueCommand(c, null);
+    }
+  }
+
+  function setScale(outputName, scale) {
+    if (!root.targetConfig[outputName]) return;
+    const snap = root.pendingRevert ? root.pendingRevert : snapshotAllOutputs();
+    root.targetConfig[outputName].scale = scale;
+    _normalizeLayoutEnforceAdjacency();
+    const cmds = getBackend().buildSetScaleCmd(outputName, root.targetConfig[outputName]);
+    _applyTopologyChange(snap, cmds);
+  }
+
+  function setTransform(outputName, transform) {
+    if (!root.targetConfig[outputName]) return;
+    const snap = root.pendingRevert ? root.pendingRevert : snapshotAllOutputs();
+    root.targetConfig[outputName].transform = transform;
+    _normalizeLayoutEnforceAdjacency();
+    const cmds = getBackend().buildSetTransformCmd(outputName, root.targetConfig[outputName]);
+    _applyTopologyChange(snap, cmds);
+  }
+
+  function setVrr(outputName, enabled) {
+    if (!root.targetConfig[outputName]) return;
+    const snap = root.pendingRevert ? root.pendingRevert : snapshotAllOutputs();
+    root.targetConfig[outputName].vrr_enabled = enabled;
+    const cmds = getBackend().buildSetVrrCmd(outputName, root.targetConfig[outputName]);
+    for (const c of cmds) enqueueCommand(c, snap);
+  }
+
+  function toggleOutput(outputName, enabled) {
+    if (!root.targetConfig[outputName]) return;
+    if (!enabled && root.targetConfig[outputName].enabled !== false && _countEnabledOutputs(root.targetConfig) <= 1) {
+      Logger.w("DisplayManager", "Refusing to disable the last enabled output:", outputName);
+      return;
+    }
+    const snap = root.pendingRevert ? root.pendingRevert : snapshotAllOutputs();
+    root.targetConfig[outputName].enabled = enabled;
+    _normalizeLayoutEnforceAdjacency();
+    const cmds = getBackend().buildToggleOutputCmd(outputName, enabled);
+    _applyTopologyChange(snap, cmds);
+  }
+
+  Process {
+    id: edidReadProcess
+    property int requestId: 0
+    property string outputName: ""
+    property string rawHex: ""
+    property string readStderr: ""
+    command: []
+    running: false
+
+    stdout: StdioCollector {
+      onStreamFinished: {
+        if (edidReadProcess.requestId !== root.edidRequestId)
+          return;
+
+        const raw = String(text || "").replace(/\s+/g, "").toLowerCase();
+        if (raw.length > 0) {
+          edidReadProcess.rawHex = raw;
+          root.edidError = "";
+        }
+      }
+    }
+
+    stderr: StdioCollector {
+      onStreamFinished: {
+        if (edidReadProcess.requestId !== root.edidRequestId)
+          return;
+
+        const err = text.trim();
+        if (err.length > 0)
+          edidReadProcess.readStderr = err;
+      }
+    }
+
+    onExited: function (exitCode) {
+      if (edidReadProcess.requestId !== root.edidRequestId)
+        return;
+
+      const raw = String(edidReadProcess.rawHex || "").trim();
+      if (exitCode !== 0 || raw === "") {
+        root.edidError = edidReadProcess.readStderr !== "" ? edidReadProcess.readStderr : "Failed to read EDID";
+        root.edidHex = "";
+        root.edidDecoded = "";
+        root.edidDecodeError = "";
+        root.edidSummary = _makeEmptyEdidSummary(edidReadProcess.outputName);
+        root.edidSummary.parseStatus = "read_error";
+        root.edidLoading = false;
+        return;
+      }
+
+      root.edidHex = raw;
+      root.edidError = "";
+      root._startEdidDecode(raw, edidReadProcess.outputName, edidReadProcess.requestId);
+    }
+  }
+
+  Process {
+    id: edidDecodeProcess
+    property int requestId: 0
+    property string outputName: ""
+    property string decodedStdout: ""
+    property string decodeStderr: ""
+    command: []
+    running: false
+
+    stdout: StdioCollector {
+      onStreamFinished: {
+        if (edidDecodeProcess.requestId !== root.edidRequestId)
+          return;
+        edidDecodeProcess.decodedStdout = text;
+      }
+    }
+
+    stderr: StdioCollector {
+      onStreamFinished: {
+        if (edidDecodeProcess.requestId !== root.edidRequestId)
+          return;
+        const err = text.trim();
+        if (err.length > 0)
+          edidDecodeProcess.decodeStderr = err;
+      }
+    }
+
+    onExited: function (exitCode) {
+      if (edidDecodeProcess.requestId !== root.edidRequestId)
+        return;
+
+      if (exitCode === 0) {
+        const payload = root._splitDecodedEdidOutput(edidDecodeProcess.decodedStdout);
+        const decoded = String(payload.text || "").trim();
+        root.edidDecoded = decoded;
+        root.edidDecodeError = "";
+        root.edidSummary = root._buildEdidSummary(
+          decoded,
+          edidDecodeProcess.outputName,
+          payload.source,
+          decoded !== "" ? "decoded" : "decoded_empty"
+        );
+      } else {
+        const errText = String(edidDecodeProcess.decodeStderr || "").trim();
+        const decodeError = errText !== "" ? errText : "Failed to decode EDID";
+        root.edidDecoded = "";
+        root.edidDecodeError = decodeError;
+        root.edidSummary = root._buildEdidSummary(
+          "",
+          edidDecodeProcess.outputName,
+          "",
+          exitCode === 127 ? "decoder_unavailable" : "decode_error"
+        );
+        root.edidSummary.warnings = [decodeError];
+      }
+
+      root.edidLoading = false;
+    }
+  }
+
+  Process {
+    id: persistProcess
+    command: []
+    running: false
+
+    stdout: StdioCollector {
+      onStreamFinished: {
+        const out = text || "";
+        root.persistDidWrite = out.indexOf("__NOCTALIA_PERSIST_SAVED__") >= 0;
+        if (out.indexOf("__NOCTALIA_PERSIST_UNCHANGED__") >= 0)
+          Logger.i("DisplayManager", "Display persistence skipped: managed block unchanged");
+      }
+    }
+
+    stderr: StdioCollector {
+      onStreamFinished: {
+        const err = text.trim();
+        if (err.length > 0) {
+          root.persistError = err;
+          Logger.e("DisplayManager", "Persist display config error:", err);
+        }
+      }
+    }
+
+    onExited: function (exitCode) {
+      root.persistRunning = false;
+      if (exitCode === 0) {
+        if (root.persistDidWrite) {
+          Logger.i("DisplayManager", "Display config persisted to compositor config");
+          ToastService.showNotice(I18n.tr("common.monitor"), "Display configuration saved");
+        }
+      } else if (!root.persistError) {
+        root.persistError = "Failed to persist display config";
+        Logger.e("DisplayManager", "Persist display config failed with exit code:", exitCode);
+      }
+
+      if (exitCode !== 0)
+        ToastService.showWarning(I18n.tr("common.monitor"), root.persistError || "Failed to save display configuration");
+    }
+  }
+
+  Component.onCompleted: {
+    Logger.i("DisplayService", "Service started with backend:", root._getDisplayBackendHint());
+    refresh();
+  }
+
+  Connections {
+    target: typeof CompositorService !== "undefined" ? CompositorService : null
+
+    function onBackendChanged() {
+      if (root.loading) return;
+      root.refresh();
+    }
+  }
+
+  Process {
+    id: fetchProcess
+    command: ["bash", "-c", root._buildFetchScript()]
+    running: false
+
+    stderr: StdioCollector {
+      onStreamFinished: {
+        if (text.trim()) {
+          Logger.e("DisplayManager", "Error fetching outputs:", text);
+          root.error = text.trim();
+        }
+      }
+    }
+    stdout: StdioCollector {
+      onStreamFinished: {
+        try {
+          // Keep previous target values as fallback when backend omits fields transiently.
+          const previousTarget = root.targetConfig;
+          const payload = JSON.parse(text);
+          root.compositor = payload.compositor || "niri";
+          // root.compositor = "readonly";
+          const data = getBackend().parseFetch(payload.data);
+
+          const payloadType = Array.isArray(payload.data) ? "array" : typeof payload.data;
+          Logger.i("DisplayService", "Parsed outputs:", Object.keys(data).length, "backend:", root.compositor, "payloadType:", payloadType);
+
+          root.outputs = data;
+          const list = [];
+          for (const key in data) {
+            const out = data[key];
+            out._key = key;
+            list.push(out);
+          }
+          list.sort((a, b) => (a.name || "").localeCompare(b.name || ""));
+          root.outputsList = list;
+          root.targetConfig = root._buildCurrentState(previousTarget);
+        } catch (e) {
+          Logger.e("DisplayManager", "Failed to parse outputs:", e, "Text:", text);
+          root.error = "Failed to parse output data";
+        } finally {
+          root.loading = false;
+        }
+      }
+    }
+  }
+
+}
